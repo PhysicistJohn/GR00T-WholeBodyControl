@@ -2181,14 +2181,9 @@ class G1Deploy {
         model_path(model_file_path),
         planner_path(planner_file_path) {
       
-      // Initialize ChannelFactory
-      // HANDSIM 2026-06-18: Init(domain,"lo") builds an interface-only cyclonedds
-      // config with NO localhost peers, so on a multicast-less lo it never
-      // discovers the Isaac sim's python unitree_sdk2py participant. Feed a
-      // dds_parameter.json whose Participant.Config points at a cyclonedds config
-      // with lo + <Peers><Peer address="localhost"/></Peers> (proven to discover
-      // the sim). This is the only path that injects peers into the C++ participant.
-      ChannelFactory::Instance()->Init(std::string("/tmp/sonic_dds_param.json"));
+      // Initialize ChannelFactory — UPSTREAM ORIGINAL (reverted the Isaac-lo
+      // sonic_dds_param.json hack; we run the shipped SONIC↔MuJoCo recipe). [MULTI-48]
+      ChannelFactory::Instance()->Init(0, networkInterface);
 
       // Initialize Dex3 hands (ChannelFactory already initialized above)
       dex3_hands_.initialize("");
