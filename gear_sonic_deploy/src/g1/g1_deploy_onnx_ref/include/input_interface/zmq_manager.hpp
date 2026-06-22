@@ -445,6 +445,27 @@ class ZMQManager : public InputInterface {
     }
 
   private:
+    MovementState BuildMovementStateFromPlannerMessage(const PlannerMessage& msg) const {
+      MovementState mode_state(
+        msg.mode,
+        msg.movement,
+        msg.facing,
+        msg.speed,
+        msg.height
+      );
+
+      if (is_squat_motion_mode(static_cast<LocomotionMode>(mode_state.locomotion_mode))) {
+        if (mode_state.height < 0.2) mode_state.height = 0.2;
+      }
+      if (is_static_motion_mode(static_cast<LocomotionMode>(mode_state.locomotion_mode))) {
+        mode_state.movement_speed = -1.0f;
+      }
+
+      mode_state.facing_direction = normalize_vector_d(mode_state.facing_direction);
+      mode_state.movement_direction = normalize_vector_d(mode_state.movement_direction);
+      return mode_state;
+    }
+
     // Handle planner mode input (similar to GamepadManager::handleGamepadPlannerInput)
     void handlePlannerInput(MotionDataReader& motion_reader,
                            std::shared_ptr<const MotionSequence>& current_motion,
@@ -528,16 +549,37 @@ class ZMQManager : public InputInterface {
         operator_state.start = true;
         {
           std::lock_guard<std::mutex> lock(current_motion_mutex);
-          operator_state.play = false;
+          operator_state.play = true;
           reinitialize_heading = true;
         }
 
-        // Ensure planner is enabled
+        bool should_enable_planner = false;
+        PlannerMessage planner_msg;
+        {
+          std::lock_guard<std::mutex> lock(planner_mutex_);
+          should_enable_planner =
+            latest_planner_message_.valid &&
+            latest_planner_message_.mode != static_cast<int>(LocomotionMode::IDLE);
+          if (should_enable_planner) {
+            planner_msg = latest_planner_message_;
+          }
+        }
+
+        // Start CONTROL on the loaded reference motion for IDLE. Enabling the
+        // planner for IDLE can generate a non-neutral pose before the robot is
+        // grounded in headless sim, so defer planner startup until the first
+        // non-IDLE intent arrives.
+        if (!should_enable_planner) {
+          std::cout << "[ZMQManager] CONTROL started on reference motion; planner deferred until non-IDLE intent" << std::endl;
+          return;
+        }
+
         if (!planner_state.enabled) {
+          movement_state_buffer.SetData(BuildMovementStateFromPlannerMessage(planner_msg));
           planner_state.enabled = true;
           std::cout << "[ZMQManager] Planner enabled" << std::endl;
         }
-        
+
         // Wait for initialization
         auto wait_start = std::chrono::steady_clock::now();
         constexpr auto PLANNER_INIT_TIMEOUT = std::chrono::seconds(5);
@@ -574,6 +616,59 @@ class ZMQManager : public InputInterface {
         }
       }
 
+      // Lazily enable planner after CONTROL is already running, but only for
+      // actual locomotion intents. IDLE remains on the neutral reference stand.
+      if (operator_state.start && !planner_state.enabled) {
+        bool should_enable_planner = false;
+        PlannerMessage planner_msg;
+        {
+          std::lock_guard<std::mutex> lock(planner_mutex_);
+          should_enable_planner =
+            latest_planner_message_.valid &&
+            latest_planner_message_.mode != static_cast<int>(LocomotionMode::IDLE);
+          if (should_enable_planner) {
+            planner_msg = latest_planner_message_;
+          }
+        }
+        if (should_enable_planner) {
+          movement_state_buffer.SetData(BuildMovementStateFromPlannerMessage(planner_msg));
+          planner_state.enabled = true;
+          std::cout << "[ZMQManager] Planner enabled by non-IDLE intent" << std::endl;
+
+          auto wait_start = std::chrono::steady_clock::now();
+          constexpr auto PLANNER_INIT_TIMEOUT = std::chrono::seconds(5);
+          while (planner_state.enabled) {
+            {
+              std::lock_guard<std::mutex> lock(current_motion_mutex);
+              if (current_motion->name == "planner_motion") {
+                std::cout << "[ZMQManager] motion name is planner_motion" << std::endl;
+                break;
+              }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            auto elapsed = std::chrono::steady_clock::now() - wait_start;
+            if (elapsed > PLANNER_INIT_TIMEOUT) {
+              std::cerr << "[ZMQCommandManager ERROR] Planner initialization timeout" << std::endl;
+              operator_state.stop = true;
+              return;
+            }
+            std::cout << "[ZMQManager] Waiting for planner to be initialized" << std::endl;
+          }
+
+          if (!planner_state.enabled || !planner_state.initialized) {
+            std::cerr << "[ZMQCommandManager ERROR] Planner failed to initialize. Stopping control." << std::endl;
+            operator_state.stop = true;
+            return;
+          }
+
+          is_planner_ready_ = true;
+          {
+            std::lock_guard<std::mutex> lock(current_motion_mutex);
+            operator_state.play = true;
+          }
+        }
+      }
+
       // Apply planner commands if planner is ready
       if (planner_state.enabled && planner_state.initialized) {
         std::lock_guard<std::mutex> lock(planner_mutex_);
@@ -591,25 +686,7 @@ class ZMQManager : public InputInterface {
           has_hand_joints_ = latest_planner_message_.left_hand_joints.has_value() || 
                              latest_planner_message_.right_hand_joints.has_value();
 
-          MovementState mode_state(
-            latest_planner_message_.mode,
-            latest_planner_message_.movement,
-            latest_planner_message_.facing,
-            latest_planner_message_.speed,
-            latest_planner_message_.height
-          );
-
-          if (is_squat_motion_mode(static_cast<LocomotionMode>(mode_state.locomotion_mode))) {
-            if (mode_state.height < 0.2) mode_state.height = 0.2;
-          }
-          if (is_static_motion_mode(static_cast<LocomotionMode>(mode_state.locomotion_mode))) {
-            mode_state.movement_speed = -1.0f;
-          }
-
-          // normalize facing direction and movement direction
-          mode_state.facing_direction = normalize_vector_d(mode_state.facing_direction);
-          mode_state.movement_direction = normalize_vector_d(mode_state.movement_direction);
-
+          MovementState mode_state = BuildMovementStateFromPlannerMessage(latest_planner_message_);
           movement_state_buffer.SetData(mode_state);
           
           if constexpr (DEBUG_LOGGING) {

@@ -585,10 +585,14 @@ def main(config: InferenceConfig):
                 if send_cpp_control_command(start=False, planner=current_planner):
                     print("Stopped C++ control loop")
             else:
-                print("Starting C++ control loop in PLANNER mode...")
-                if send_cpp_control_command(start=True, planner=True):
-                    print("Started C++ control loop in PLANNER mode")
-                    print("Press 'i' to send initial pose and switch to POSE mode")
+                # HANDSIM LOCAL: start directly in POSE mode — no planner is
+                # deployed (planner_sonic.onnx does not convert on TensorRT 11,
+                # see NVlabs/GR00T-WholeBodyControl#184), and a start-PLANNER
+                # command makes the C++ ZMQCommandManager exit.
+                print("Starting C++ control loop in POSE mode (no planner)...")
+                if send_cpp_control_command(start=True, planner=False):
+                    print("Started C++ control loop in POSE mode")
+                    print("Press 'i' to send initial pose")
                     if pause_loop:
                         print("Note: Policy loop is paused - press 'p' to resume")
         elif key == "[":

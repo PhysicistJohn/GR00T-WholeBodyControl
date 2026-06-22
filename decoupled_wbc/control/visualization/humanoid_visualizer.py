@@ -1,6 +1,5 @@
 import time
 
-import meshcat_shapes
 import numpy as np
 from pinocchio.visualize import MeshcatVisualizer
 
@@ -31,6 +30,7 @@ class RobotVisualizer:
         self.viz_frames = [self.robot.supplemental_info.root_frame_name]
         for side in ["left", "right"]:
             self.viz_frames.append(self.robot.supplemental_info.hand_frame_names[side])
+        import meshcat_shapes
         for frame in self.viz_frames:
             meshcat_shapes.frame(self.viz.viewer[frame], opacity=1.0)
 

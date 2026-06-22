@@ -340,54 +340,15 @@ public:
             return false;
         }
 
-        // ==== BEGIN FRESH INITIALIZATION ====
-        // Initialize input vectors with defaults aligned to robot's current orientation
-        // Extract yaw from robot's base quaternion to set proper facing direction
-        UpdateInputTensors(static_cast<int>(LocomotionMode::IDLE),
-            -1.0,
-            -1.0,
-            {0.0f, 0.0f, 0.0f},  // No movement
-            {1.0f, 0.0f, 0.0f},  // Face in robot's current yaw direction
-            current_random_seed_
-        );
-
-        // Initialize context directly
+        // Initialize context directly. Do not publish a default planner-IDLE
+        // trajectory here; the caller seeds MovementState before enabling the
+        // planner, and the first generated trajectory must use that command.
         gen_frame_ = 0;
         InitializeContext(base_quat, joint_positions);
 
-        // Run initial inference with default parameters to populate motion data
-        try {
-            // Start timing model inference
-            auto model_start_time = std::chrono::high_resolution_clock::now();
-
-            RunInference();
-
-            auto model_end_time = std::chrono::high_resolution_clock::now();
-
-            // Start timing data extraction
-            auto extract_start_time = std::chrono::high_resolution_clock::now();
-
-            ResampleGeneratedSequence50Hz();
-
-            auto extract_end_time = std::chrono::high_resolution_clock::now();
-            
-            // Log initialization timing
-            auto model_duration = std::chrono::duration_cast<std::chrono::microseconds>(model_end_time - model_start_time);
-            auto extract_duration = std::chrono::duration_cast<std::chrono::microseconds>(extract_end_time - extract_start_time);
-
-            std::cout << "Planner Init timing - Model: " << model_duration.count() << "us"
-                    << ", Extract: " << extract_duration.count() << "us" << std::endl;
-
-            // Mark as fully initialized only after all setup is complete
-            planner_state_.initialized = true;
-
-            std::cout << "Planner initialized" << std::endl;
-
-        } catch (const std::exception& e) {
-            std::cout << "✗ Error during planner initialization: " << e.what() << std::endl;
-            planner_state_.initialized = false;
-            return false;
-        }
+        planner_state_.initialized = true;
+        motion_available_ = false;
+        std::cout << "Planner initialized; waiting for first movement command replan" << std::endl;
 
         return true;
     }
@@ -553,9 +514,13 @@ public:
         // Update input tensors with new values
         UpdateInputTensors(mode_value, target_vel, target_height, movement_direction, facing_direction, random_seed);
         
-        // Update context and get frame information
+        // Update context and get frame information. A null motion_sequence is
+        // used for the first command after Initialize(); in that case preserve
+        // the measured robot-state context populated by InitializeContext().
         gen_frame_ = gen_frame + config_.motion_look_ahead_steps;
-        UpdateContextFromMotion(motion_sequence);
+        if (motion_sequence) {
+            UpdateContextFromMotion(motion_sequence);
+        }
 
         auto gather_input_end_time = std::chrono::steady_clock::now();
 

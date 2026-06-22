@@ -374,7 +374,7 @@ class ElasticBand:
         self.kp_ang = 1000
         self.kd_ang = 10
         self.point = np.array([0, 0, 1])
-        self.length = 0
+        self.length = -0.26  # [MULTI-48] hold pelvis at ~0.74 (standing), not lifted to 1.0, so headless release doesn't drop the robot
         self.enable = True
 
     def Advance(self, pose):

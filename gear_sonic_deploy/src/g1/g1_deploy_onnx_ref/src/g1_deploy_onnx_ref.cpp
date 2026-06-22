@@ -2182,7 +2182,13 @@ class G1Deploy {
         planner_path(planner_file_path) {
       
       // Initialize ChannelFactory
-      ChannelFactory::Instance()->Init(0, networkInterface);
+      // HANDSIM 2026-06-18: Init(domain,"lo") builds an interface-only cyclonedds
+      // config with NO localhost peers, so on a multicast-less lo it never
+      // discovers the Isaac sim's python unitree_sdk2py participant. Feed a
+      // dds_parameter.json whose Participant.Config points at a cyclonedds config
+      // with lo + <Peers><Peer address="localhost"/></Peers> (proven to discover
+      // the sim). This is the only path that injects peers into the C++ participant.
+      ChannelFactory::Instance()->Init(std::string("/tmp/sonic_dds_param.json"));
 
       // Initialize Dex3 hands (ChannelFactory already initialized above)
       dex3_hands_.initialize("");
@@ -3164,23 +3170,46 @@ class G1Deploy {
           bool success = false;
           if(planner_motion_->timesteps == 0)
           {
-            // step through the frames and copy the animation over:
+            const int first_planner_blend_frames = 50;
+            const bool have_reference =
+              current_motion_ && current_motion_->timesteps > 0 &&
+              current_motion_->GetNumJoints() == planner_motion_gen.GetNumJoints();
+            const int ref_frame = have_reference
+              ? std::clamp(current_frame_, 0, current_motion_->timesteps - 1)
+              : 0;
+
+            // First planner takeover used to snap directly from the standing
+            // reference to the generated gait. In headless sim that impulse can
+            // throw the robot before the policy has a chance to stabilize, so
+            // ramp the generated clip in over roughly one second.
             for(int f = 0; f < planner_motion_gen.timesteps; ++f)
             {
-              std::copy(
-                planner_motion_gen.JointPositions(f),
-                planner_motion_gen.JointPositions(f) + planner_motion_gen.GetNumJoints(),
-                planner_motion_->JointPositions(f)
-              );
+              double w_new = std::clamp(static_cast<double>(f) / first_planner_blend_frames, 0.0, 1.0);
+              double w_ref = 1.0 - w_new;
 
-              std::copy(
-                planner_motion_gen.JointVelocities(f),
-                planner_motion_gen.JointVelocities(f) + planner_motion_gen.GetNumJoints(),
-                planner_motion_->JointVelocities(f)
-              );
+              for(size_t j = 0; j < planner_motion_gen.GetNumJoints(); ++j)
+              {
+                const double ref_q = have_reference ? current_motion_->JointPositions(ref_frame)[j] : planner_motion_gen.JointPositions(f)[j];
+                planner_motion_->JointPositions(f)[j] =
+                  w_ref * ref_q + w_new * planner_motion_gen.JointPositions(f)[j];
+                planner_motion_->JointVelocities(f)[j] =
+                  w_new * planner_motion_gen.JointVelocities(f)[j];
+              }
 
-              planner_motion_->BodyPositions(f)[0] = planner_motion_gen.BodyPositions(f)[0];
-              planner_motion_->BodyQuaternions(f)[0] = planner_motion_gen.BodyQuaternions(f)[0];
+              if (have_reference && current_motion_->GetNumBodies() > 0 && current_motion_->GetNumBodyQuaternions() > 0) {
+                for(int j = 0; j < 3; ++j) {
+                  planner_motion_->BodyPositions(f)[0][j] =
+                    w_ref * current_motion_->BodyPositions(ref_frame)[0][j] +
+                    w_new * planner_motion_gen.BodyPositions(f)[0][j];
+                }
+                planner_motion_->BodyQuaternions(f)[0] =
+                  quat_slerp_d(current_motion_->BodyQuaternions(ref_frame)[0],
+                               planner_motion_gen.BodyQuaternions(f)[0],
+                               w_new);
+              } else {
+                planner_motion_->BodyPositions(f)[0] = planner_motion_gen.BodyPositions(f)[0];
+                planner_motion_->BodyQuaternions(f)[0] = planner_motion_gen.BodyQuaternions(f)[0];
+              }
             }
             planner_motion_->timesteps = planner_motion_gen.timesteps;
             success = true;
@@ -3614,10 +3643,7 @@ class G1Deploy {
             }
           } 
           else {
-            if (planner_motion_->timesteps == 0) {
-              std::cout << "Planner() no data in planner_motion_, returning. If control loop is started, this should only happen once when planner is initialized. If control loop is not started, this should keep returning until control loop is started." << std::endl;
-              return;
-            }
+            bool first_planner_replan = planner_motion_->timesteps == 0;
             bool need_replan = false;
 
             // bool of different reason to replan
@@ -3695,6 +3721,9 @@ class G1Deploy {
             } else if (!under_static_motion_mode && (movement_speed_changed || movement_direction_changed || (time_to_replan && movement_state_data.data->movement_speed != 0))) {
               need_replan = true;
             }
+            if (first_planner_replan) {
+              need_replan = true;
+            }
 
             if (!need_replan) {
               // no need to replan, return
@@ -3731,10 +3760,13 @@ class G1Deploy {
             try {
               // Update planning with current movement parameters
 
+              std::shared_ptr<const MotionSequence> planning_context_motion =
+                first_planner_replan ? nullptr : planner_motion_;
+
               // gotta make sure planner_motion actually has data...
               if(!planner_->UpdatePlanning(
                 current_frame_,
-                planner_motion_,
+                planning_context_motion,
                 current_mode,
                 movement_speed,
                 target_height,
@@ -4468,4 +4500,3 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-

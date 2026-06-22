@@ -182,6 +182,7 @@ class DefaultEnv:
                 )
 
         # Enable the elastic band
+        self.elastic_band = None  # [MULTI-48] referenced unconditionally below; init or headless band-off crashes
         if self.config["ENABLE_ELASTIC_BAND"] and self.use_floating_root_link:
             self.elastic_band = ElasticBand()
             if "g1" in self.config["ROBOT_TYPE"]:
@@ -392,6 +393,11 @@ class DefaultEnv:
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
         if self.elastic_band:
+            # [MULTI-48] headless band-through-handoff: hold the robot while the
+            # policy enters CONTROL, then release once /tmp/release_band appears.
+            if self.elastic_band.enable and os.path.exists("/tmp/release_band"):
+                self.elastic_band.enable = False
+                print("[base_sim] /tmp/release_band -> elastic band released", flush=True)
             if self.elastic_band.enable and self.use_floating_root_link:
                 pose = np.concatenate(
                     [
