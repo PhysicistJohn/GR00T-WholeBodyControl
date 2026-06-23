@@ -65,6 +65,10 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <atomic>
+#include <cstdlib>
+#include <cstdio>
+#include <thread>
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -252,6 +256,9 @@ class G1Deploy {
     bool reinitialize_heading_ = true;
     bool report_temperature_ = false;
     std::string pending_tts_;  // One-shot TTS message, consumed by GatherInputInterfaceData()
+    std::string hot_reload_signal_path_;
+    std::thread hot_reload_thread_;
+    std::atomic<bool> hot_reload_stop_{false};
 
     // Per-motor high temperature hysteresis (enter at >= 90, exit at < 85)
     std::array<bool, G1_NUM_MOTOR> motor_high_temp_ = {};
@@ -2392,6 +2399,7 @@ class G1Deploy {
       // Set encode_mode for planner motion
       planner_motion_->SetEncodeMode(initial_encoder_mode_);
       std::cout << "Planner motion encode_mode set to: " << initial_encoder_mode_ << std::endl;
+      StartMotionHotReloadWatcher();
 
       // Initialize planner
       if (!planner_path.empty()) {
@@ -2594,7 +2602,68 @@ class G1Deploy {
 
     ~G1Deploy()
     {
+      hot_reload_stop_.store(true);
+      if (hot_reload_thread_.joinable()) {
+        hot_reload_thread_.join();
+      }
       // CUDA resources are now cleaned up by the PolicyEngine and planner classes automatically
+    }
+
+    void StartMotionHotReloadWatcher() {
+      const char* env_path = std::getenv("SONIC_MOTION_RELOAD_FILE");
+      hot_reload_signal_path_ = env_path && env_path[0] ? env_path : "/tmp/sonic_motion_reload";
+      hot_reload_thread_ = std::thread([this]() {
+        std::string last_request;
+        while (!hot_reload_stop_.load()) {
+          std::ifstream f(hot_reload_signal_path_);
+          std::string request;
+          if (f.good()) {
+            std::getline(f, request);
+          }
+          if (!request.empty() && request != last_request) {
+            last_request = request;
+            const auto sep = request.find('|');
+            const std::string motion_path = sep == std::string::npos ? request : request.substr(0, sep);
+            LoadHotReferenceMotion(motion_path);
+            std::remove(hot_reload_signal_path_.c_str());
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+      });
+      std::cout << "[MotionHotReload] watching " << hot_reload_signal_path_ << std::endl;
+    }
+
+    bool LoadHotReferenceMotion(const std::string& motion_data_path) {
+      MotionDataReader reader;
+      if (!reader.ReadFromCSV(motion_data_path) || reader.motions.empty()) {
+        std::cerr << "[MotionHotReload] failed to load motion data from " << motion_data_path << std::endl;
+        return false;
+      }
+      for (auto& motion : reader.motions) {
+        motion->SetEncodeMode(initial_encoder_mode_);
+      }
+      std::string motion_name;
+      {
+        std::lock_guard<std::mutex> lock(current_motion_mutex_);
+        if (planner_) {
+          planner_->planner_state_.enabled = false;
+          planner_->planner_state_.initialized = false;
+        }
+        motion_reader_ = std::move(reader);
+        motion_reader_.current_motion_index_ = 0;
+        current_motion_ = motion_reader_.GetMotionShared(0);
+        motion_name = current_motion_ ? current_motion_->name : "";
+        current_frame_ = 0;
+        saved_frame_for_observation_window_ = 0;
+        operator_state.start = true;
+        operator_state.play = true;
+        reinitialize_heading_ = true;
+        idle_readapt_stored_ = false;
+        idle_readapt_state_ = IdleReadaptState::IDLE;
+      }
+      std::cout << "[MotionHotReload] loaded and playing "
+                << motion_name << " from " << motion_data_path << std::endl;
+      return true;
     }
 
     void SetThreadPriority() {

@@ -678,6 +678,8 @@ class MotionDataReader {
     /// @return True if at least one motion was loaded successfully.
     bool ReadFromCSV(const std::string& base_directory) {
       std::cout << "Reading motion data from CSV files in: " << base_directory << std::endl;
+      motions.clear();
+      current_motion_index_ = 0;
 
       // Auto-discover motion folders
       std::vector<std::string> motion_names;
