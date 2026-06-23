@@ -3410,10 +3410,8 @@ class G1Deploy {
             } else {
               std::cout << "Temporary motion completed." << std::endl;
             }
-            current_frame_ = 0; // Reset to beginning
-            // Total reset: both base quaternion and delta heading
-            reinitialize_heading_ = true;
-            std::cout << "Reset to frame 0." << std::endl;
+            current_frame_ = std::max(0, current_motion_->timesteps - 1);
+            std::cout << "Holding final frame." << std::endl;
           }
         } else {
           if (current_frame_ >= current_motion_->timesteps - saved_frame_for_observation_window_) {
