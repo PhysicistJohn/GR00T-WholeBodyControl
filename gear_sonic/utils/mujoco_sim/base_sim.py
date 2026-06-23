@@ -394,10 +394,18 @@ class DefaultEnv:
             self.unitree_bridge.PublishWirelessController()
         if self.elastic_band:
             # [MULTI-48] headless band-through-handoff: hold the robot while the
-            # policy enters CONTROL, then release once /tmp/release_band appears.
-            if self.elastic_band.enable and os.path.exists("/tmp/release_band"):
-                self.elastic_band.enable = False
-                print("[base_sim] /tmp/release_band -> elastic band released", flush=True)
+            # policy enters CONTROL. Treat /tmp/release_band as a live toggle so
+            # the web console can reattach the band after an unstable generated
+            # motion without restarting MuJoCo.
+            should_enable_band = not os.path.exists("/tmp/release_band")
+            if self.elastic_band.enable != should_enable_band:
+                if should_enable_band:
+                    band_pos = self.mj_data.xpos[self.band_attached_link].copy()
+                    self.elastic_band.point = np.array([band_pos[0], band_pos[1], 1.0])
+                    self.mj_data.qvel[: self.qvel_offset] = 0
+                self.elastic_band.enable = should_enable_band
+                state = "attached" if should_enable_band else "released"
+                print(f"[base_sim] /tmp/release_band -> elastic band {state}", flush=True)
             if self.elastic_band.enable and self.use_floating_root_link:
                 pose = np.concatenate(
                     [
