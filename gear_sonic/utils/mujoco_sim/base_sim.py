@@ -171,6 +171,55 @@ def _scene_mesh_path(repo: Path, kind: str, model_name: str) -> Path | None:
     return None
 
 
+def _prepare_handsim_mjcf_collision(elem: ET.Element, prefix: str) -> None:
+    name = elem.get("name")
+    if name:
+        elem.set("name", f"{prefix}_{name}")
+    if elem.tag == "geom":
+        elem.attrib.pop("material", None)
+        elem.set("contype", "1")
+        elem.set("conaffinity", "1")
+        elem.set("friction", "1.0 0.01 0.001")
+        elem.set("rgba", "0.85 0.22 0.16 0.16")
+    for child in list(elem):
+        _prepare_handsim_mjcf_collision(child, prefix)
+
+
+def _handsim_mjcf_collision_body(repo: Path, raw_name: str, cfg: dict, x: float, y: float, yaw: float) -> str | None:
+    if cfg.get("kind") != "benchtop_setup":
+        return None
+    source = repo / "assets" / "render" / "benchtop" / "keysight_bench_setup.xml"
+    try:
+        root = ET.parse(source).getroot()
+    except (OSError, ET.ParseError) as exc:
+        print(f"[handsim-collision] benchtop setup missing: {source} ({exc})", flush=True)
+        return None
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        return None
+
+    prefix = "handsim_col_" + _safe_xml_name(str(raw_name))
+    children = []
+    for child in list(worldbody):
+        if child.tag == "light":
+            continue
+        if child.tag == "geom" and child.get("type") == "plane":
+            continue
+        cloned = ET.fromstring(ET.tostring(child, encoding="unicode"))
+        _prepare_handsim_mjcf_collision(cloned, prefix)
+        children.append(ET.tostring(cloned, encoding="unicode"))
+    if not children:
+        return None
+    z = float(cfg.get("z", 0.0))
+    body = "\n      ".join(children)
+    return (
+        f'    <body name="{prefix}" pos="{_xml_num(x)} {_xml_num(y)} {_xml_num(z)}" '
+        f'euler="0 0 {_xml_num(yaw)}">\n'
+        f"      {body}\n"
+        "    </body>\n"
+    )
+
+
 def _handsim_collision_assets_and_geoms(scene: dict, repo: Path, anchor_xy: tuple[float, float]) -> tuple[list[str], list[str]]:
     assets = []
     geoms = []
@@ -192,7 +241,11 @@ def _handsim_collision_assets_and_geoms(scene: dict, repo: Path, anchor_xy: tupl
         scale = float(cfg.get("mesh_scale", cfg.get("scale", 1.0)))
         key = "handsim_col_" + _safe_xml_name(str(raw_name))
 
-        if kind == "wall":
+        if kind == "benchtop_setup":
+            body = _handsim_mjcf_collision_body(repo, str(raw_name), cfg, x, y, yaw)
+            if body:
+                geoms.append(body)
+        elif kind == "wall":
             size = cfg.get("size", [1.0, 0.06])
             height = float(cfg.get("height", 1.5))
             geoms.append(_box_geom(key, x, y, height * 0.5, float(size[0]), float(size[1]), height * 0.5, yaw))
