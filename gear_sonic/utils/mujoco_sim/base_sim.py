@@ -44,6 +44,10 @@ def _xml_num(value: float) -> str:
     return f"{float(value):.5g}"
 
 
+def _xml_attr(value: Path | str) -> str:
+    return str(value).replace("&", "&amp;").replace('"', "&quot;")
+
+
 def _load_handsim_collision_scene_config() -> tuple[Path, dict] | None:
     config_path = os.environ.get("HANDSIM_COLLISION_SCENE_CONFIG", "").strip()
     if not config_path:
@@ -139,7 +143,36 @@ def _capsule_geom(name: str, x: float, y: float, z: float, radius: float, half_h
     )
 
 
-def _handsim_collision_geoms(scene: dict, repo: Path, anchor_xy: tuple[float, float]) -> list[str]:
+def _mesh_collision_asset(mesh_name: str, obj_path: Path, scale: float) -> str:
+    return (
+        f'    <mesh name="{mesh_name}" file="{_xml_attr(obj_path)}" '
+        f'scale="{_xml_num(scale)} {_xml_num(scale)} {_xml_num(scale)}"/>\n'
+    )
+
+
+def _mesh_collision_body(name: str, mesh_name: str, x: float, y: float, z: float, yaw: float) -> str:
+    return (
+        f'    <body name="{name}_body" pos="{_xml_num(x)} {_xml_num(y)} {_xml_num(z)}" '
+        f'euler="0 0 {_xml_num(yaw)}">\n'
+        f'      <geom name="{name}" type="mesh" mesh="{mesh_name}" '
+        'contype="1" conaffinity="1" friction="1.0 0.01 0.001" '
+        'rgba="0.85 0.22 0.16 0.18"/>\n'
+        '    </body>\n'
+    )
+
+
+def _scene_mesh_path(repo: Path, kind: str, model_name: str) -> Path | None:
+    if not model_name:
+        return None
+    if kind == "abo":
+        return repo / "external" / "abo_render_assets" / model_name / "model.obj"
+    if kind == "scanned":
+        return repo / "external" / "mujoco_scanned_objects" / "models" / model_name / "model.obj"
+    return None
+
+
+def _handsim_collision_assets_and_geoms(scene: dict, repo: Path, anchor_xy: tuple[float, float]) -> tuple[list[str], list[str]]:
+    assets = []
     geoms = []
     ax, ay = anchor_xy
 
@@ -184,6 +217,13 @@ def _handsim_collision_geoms(scene: dict, repo: Path, anchor_xy: tuple[float, fl
             s = scale
             geoms.append(_capsule_geom(key + "_post", x, y, 0.75 * s, 0.035 * s, 0.75 * s))
         elif kind == "abo":
+            model_name = str(cfg.get("model", "")).strip()
+            obj_path = _scene_mesh_path(repo, kind, model_name)
+            if obj_path is not None and obj_path.exists():
+                mesh_name = "handsim_mesh_" + _safe_xml_name(str(raw_name))
+                assets.append(_mesh_collision_asset(mesh_name, obj_path, scale))
+                geoms.append(_mesh_collision_body(key, mesh_name, x, y, float(cfg.get("z", 0.0)), yaw))
+                continue
             shadow = cfg.get("shadow", [0.45, 0.35])
             if not isinstance(shadow, list | tuple) or len(shadow) < 2:
                 shadow = [0.45, 0.35]
@@ -198,6 +238,13 @@ def _handsim_collision_geoms(scene: dict, repo: Path, anchor_xy: tuple[float, fl
             center_z = base_z + sz if base_z < 0.35 else base_z
             geoms.append(_box_geom(key, x, y, center_z, sx, sy, sz, yaw))
         elif kind == "scanned":
+            model_name = str(cfg.get("model", "")).strip()
+            obj_path = _scene_mesh_path(repo, kind, model_name)
+            if obj_path is not None and obj_path.exists():
+                mesh_name = "handsim_mesh_" + _safe_xml_name(str(raw_name))
+                assets.append(_mesh_collision_asset(mesh_name, obj_path, scale))
+                geoms.append(_mesh_collision_body(key, mesh_name, x, y, float(cfg.get("z", 0.0)), yaw))
+                continue
             shadow = cfg.get("shadow", [0.35, 0.25])
             if not isinstance(shadow, list | tuple) or len(shadow) < 2:
                 shadow = [0.35, 0.25]
@@ -215,7 +262,7 @@ def _handsim_collision_geoms(scene: dict, repo: Path, anchor_xy: tuple[float, fl
                 sx, sy = 0.35 * scale, 0.25 * scale
             geoms.append(_box_geom(key, x, y, 0.35 * scale, sx, sy, 0.35 * scale, yaw))
 
-    return geoms
+    return assets, geoms
 
 
 def _inject_handsim_collision_scene(xml_path: Path) -> Path:
@@ -227,13 +274,19 @@ def _inject_handsim_collision_scene(xml_path: Path) -> Path:
     repo = _handsim_repo_root(config_path)
     anchor_xy = _initial_root_xy(xml_path)
     _write_handsim_scene_anchor(anchor_xy)
-    geoms = _handsim_collision_geoms(scene, repo, anchor_xy)
+    assets, geoms = _handsim_collision_assets_and_geoms(scene, repo, anchor_xy)
     if not geoms:
         print(f"[handsim-collision] no colliders generated from {config_path}", flush=True)
         return xml_path
 
     with open(xml_path) as f:
         xml = f.read()
+    if assets:
+        asset_block = "\n" + "".join(assets)
+        if "</asset>" in xml:
+            xml = xml.replace("</asset>", asset_block + "  </asset>", 1)
+        elif "<worldbody>" in xml:
+            xml = xml.replace("<worldbody>", "<asset>\n" + "".join(assets) + "  </asset>\n\n  <worldbody>", 1)
     block = (
         "\n    <body name=\"handsim_collision_scene\" pos=\"0 0 0\">\n"
         + "".join(geoms)
@@ -247,7 +300,8 @@ def _inject_handsim_collision_scene(xml_path: Path) -> Path:
     with open(generated_path, "w") as f:
         f.write(xml)
     print(
-        f"[handsim-collision] injected {len(geoms)} static colliders from {config_path} "
+        f"[handsim-collision] injected {len(geoms)} static colliders "
+        f"({len(assets)} mesh assets) from {config_path} "
         f"at anchor ({anchor_xy[0]:.2f}, {anchor_xy[1]:.2f})",
         flush=True,
     )
