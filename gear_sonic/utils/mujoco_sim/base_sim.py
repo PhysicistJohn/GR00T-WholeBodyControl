@@ -6,9 +6,12 @@ BaseSimulator wraps DefaultEnv with rate-limiting and viewer/image update loops.
 """
 
 import os
+import json
+import math
 import pathlib
 from pathlib import Path
 import pickle
+import re
 import tempfile
 from threading import Lock, Thread
 import time
@@ -27,6 +30,228 @@ from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, Unitr
 from gear_sonic.utils.mujoco_sim.robot import Robot
 
 GEAR_SONIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+
+
+def _handsim_scene_anchor_path() -> Path:
+    return Path(os.environ.get("HANDSIM_SCENE_ANCHOR_PATH", "/tmp/handsim_scene_anchor.json"))
+
+
+def _safe_xml_name(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]", "_", value).strip("_") or "item"
+
+
+def _xml_num(value: float) -> str:
+    return f"{float(value):.5g}"
+
+
+def _load_handsim_collision_scene_config() -> tuple[Path, dict] | None:
+    config_path = os.environ.get("HANDSIM_COLLISION_SCENE_CONFIG", "").strip()
+    if not config_path:
+        return None
+    path = Path(config_path).expanduser()
+    try:
+        with open(path) as f:
+            scene = json.load(f)
+    except (OSError, ValueError) as exc:
+        print(f"[handsim-collision] scene config unavailable: {path} ({exc})", flush=True)
+        return None
+    if not isinstance(scene, dict):
+        print(f"[handsim-collision] scene config ignored: {path} is not an object", flush=True)
+        return None
+    return path, scene
+
+
+def _handsim_repo_root(config_path: Path) -> Path:
+    repo = os.environ.get("HANDSIM_REPO", "").strip()
+    if repo:
+        return Path(repo).expanduser()
+    # assets/render/worlds/outdoor_park/scene.json -> repo root
+    try:
+        return config_path.parents[3]
+    except IndexError:
+        return Path.home() / "Github" / "unitree-g1-handsim"
+
+
+def _initial_root_xy(xml_path: Path) -> tuple[float, float]:
+    try:
+        model = mujoco.MjModel.from_xml_path(str(xml_path))
+        data = mujoco.MjData(model)
+        mujoco.mj_forward(model, data)
+        if model.nq >= 2:
+            return float(data.qpos[0]), float(data.qpos[1])
+    except Exception as exc:
+        print(f"[handsim-collision] using origin anchor; base scene pre-load failed: {exc}", flush=True)
+    return 0.0, 0.0
+
+
+def _write_handsim_scene_anchor(anchor_xy: tuple[float, float]) -> None:
+    path = _handsim_scene_anchor_path()
+    payload = {"root_pos": [float(anchor_xy[0]), float(anchor_xy[1]), 0.0]}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"[handsim-collision] could not write scene anchor {path}: {exc}", flush=True)
+
+
+def _iter_handsim_scene_items(scene: dict):
+    for section in ("landmarks", "decor"):
+        items = scene.get(section, {})
+        if isinstance(items, dict):
+            yield from items.items()
+
+
+def _read_abo_extents(repo: Path, model_id: str, scale: float) -> tuple[float, float, float] | None:
+    meta_path = repo / "external" / "abo_render_assets" / model_id / "metadata.json"
+    try:
+        with open(meta_path) as f:
+            extents = json.load(f).get("extents_xyz_mujoco")
+        if isinstance(extents, list) and len(extents) >= 3:
+            return tuple(float(v) * scale for v in extents[:3])
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _box_geom(name: str, x: float, y: float, z: float, sx: float, sy: float, sz: float, yaw: float = 0.0) -> str:
+    sx = max(float(sx), 0.015)
+    sy = max(float(sy), 0.015)
+    sz = max(float(sz), 0.015)
+    return (
+        f'      <geom name="{name}" type="box" '
+        f'pos="{_xml_num(x)} {_xml_num(y)} {_xml_num(z)}" '
+        f'size="{_xml_num(sx)} {_xml_num(sy)} {_xml_num(sz)}" '
+        f'euler="0 0 {_xml_num(yaw)}" contype="1" conaffinity="1" '
+        'friction="1.0 0.01 0.001" rgba="0.85 0.22 0.16 0.16"/>\n'
+    )
+
+
+def _capsule_geom(name: str, x: float, y: float, z: float, radius: float, half_height: float) -> str:
+    return (
+        f'      <geom name="{name}" type="capsule" '
+        f'pos="{_xml_num(x)} {_xml_num(y)} {_xml_num(z)}" '
+        f'size="{_xml_num(max(radius, 0.015))} {_xml_num(max(half_height, 0.03))}" '
+        'contype="1" conaffinity="1" friction="1.0 0.01 0.001" '
+        'rgba="0.85 0.22 0.16 0.16"/>\n'
+    )
+
+
+def _handsim_collision_geoms(scene: dict, repo: Path, anchor_xy: tuple[float, float]) -> list[str]:
+    geoms = []
+    ax, ay = anchor_xy
+
+    for raw_name, cfg in _iter_handsim_scene_items(scene):
+        if not isinstance(cfg, dict):
+            continue
+        kind = str(cfg.get("kind", "")).strip()
+        if kind in {"", "empty", "path", "floor_zone"}:
+            continue
+
+        offset = cfg.get("offset", [0.0, 0.0])
+        if not isinstance(offset, list | tuple) or len(offset) < 2:
+            offset = [0.0, 0.0]
+        x = ax + float(offset[0])
+        y = ay + float(offset[1])
+        yaw = float(cfg.get("yaw", 0.0))
+        scale = float(cfg.get("mesh_scale", cfg.get("scale", 1.0)))
+        key = "handsim_col_" + _safe_xml_name(str(raw_name))
+
+        if kind == "wall":
+            size = cfg.get("size", [1.0, 0.06])
+            height = float(cfg.get("height", 1.5))
+            geoms.append(_box_geom(key, x, y, height * 0.5, float(size[0]), float(size[1]), height * 0.5, yaw))
+        elif kind == "door_frame":
+            s = scale
+            geoms.append(_box_geom(key + "_left", x - 0.86 * s, y, 1.05 * s, 0.055 * s, 0.10 * s, 1.05 * s, yaw))
+            geoms.append(_box_geom(key + "_right", x + 0.86 * s, y, 1.05 * s, 0.055 * s, 0.10 * s, 1.05 * s, yaw))
+            geoms.append(_box_geom(key + "_top", x, y, 2.07 * s, 0.92 * s, 0.10 * s, 0.07 * s, yaw))
+        elif kind == "booth":
+            s = scale
+            geoms.append(_box_geom(key + "_back", x, y, 0.78 * s, 1.15 * s, 0.08 * s, 0.78 * s, yaw))
+            dx = math.cos(yaw + math.pi * 0.5) * 0.72 * s
+            dy = math.sin(yaw + math.pi * 0.5) * 0.72 * s
+            geoms.append(_box_geom(key + "_side", x + dx, y + dy, 0.72 * s, 0.08 * s, 0.78 * s, 0.72 * s, yaw))
+        elif kind == "instrument_rack":
+            s = scale
+            geoms.append(_box_geom(key, x, y, 0.75 * s, 0.45 * s, 0.32 * s, 0.75 * s, yaw))
+        elif kind == "fence":
+            length = float(cfg.get("length", 4.0)) * scale
+            geoms.append(_box_geom(key, x, y, 0.45 * scale, length * 0.5, 0.055 * scale, 0.45 * scale, yaw))
+        elif kind == "lamp":
+            s = scale
+            geoms.append(_capsule_geom(key + "_post", x, y, 0.75 * s, 0.035 * s, 0.75 * s))
+        elif kind == "abo":
+            shadow = cfg.get("shadow", [0.45, 0.35])
+            if not isinstance(shadow, list | tuple) or len(shadow) < 2:
+                shadow = [0.45, 0.35]
+            ext = _read_abo_extents(repo, str(cfg.get("model", "")), scale)
+            if ext:
+                sx = max(float(shadow[0]) * 0.65, ext[0] * 0.5)
+                sy = max(float(shadow[1]) * 0.65, ext[1] * 0.5)
+                sz = max(ext[2] * 0.5, 0.04)
+            else:
+                sx, sy, sz = float(shadow[0]) * 0.75, float(shadow[1]) * 0.75, 0.35 * scale
+            base_z = float(cfg.get("z", 0.0))
+            center_z = base_z + sz if base_z < 0.35 else base_z
+            geoms.append(_box_geom(key, x, y, center_z, sx, sy, sz, yaw))
+        elif kind == "scanned":
+            shadow = cfg.get("shadow", [0.35, 0.25])
+            if not isinstance(shadow, list | tuple) or len(shadow) < 2:
+                shadow = [0.35, 0.25]
+            base_z = float(cfg.get("z", 0.0))
+            sx = max(float(shadow[0]) * 0.85, 0.04)
+            sy = max(float(shadow[1]) * 0.85, 0.04)
+            sz = 0.08 * scale if base_z >= 0.35 else max(0.12 * scale, 0.05)
+            center_z = base_z + sz
+            geoms.append(_box_geom(key, x, y, center_z, sx, sy, sz, yaw))
+        else:
+            shadow = cfg.get("shadow", [0.4, 0.3])
+            if isinstance(shadow, list | tuple) and len(shadow) >= 2:
+                sx, sy = float(shadow[0]), float(shadow[1])
+            else:
+                sx, sy = 0.35 * scale, 0.25 * scale
+            geoms.append(_box_geom(key, x, y, 0.35 * scale, sx, sy, 0.35 * scale, yaw))
+
+    return geoms
+
+
+def _inject_handsim_collision_scene(xml_path: Path) -> Path:
+    loaded = _load_handsim_collision_scene_config()
+    if loaded is None:
+        return xml_path
+
+    config_path, scene = loaded
+    repo = _handsim_repo_root(config_path)
+    anchor_xy = _initial_root_xy(xml_path)
+    _write_handsim_scene_anchor(anchor_xy)
+    geoms = _handsim_collision_geoms(scene, repo, anchor_xy)
+    if not geoms:
+        print(f"[handsim-collision] no colliders generated from {config_path}", flush=True)
+        return xml_path
+
+    with open(xml_path) as f:
+        xml = f.read()
+    block = (
+        "\n    <body name=\"handsim_collision_scene\" pos=\"0 0 0\">\n"
+        + "".join(geoms)
+        + "    </body>\n"
+    )
+    if "</worldbody>" not in xml:
+        print(f"[handsim-collision] scene has no worldbody close tag: {xml_path}", flush=True)
+        return xml_path
+    xml = xml.replace("</worldbody>", block + "  </worldbody>", 1)
+    generated_path = xml_path.with_name(f".{xml_path.stem}_handsim_collision.xml")
+    with open(generated_path, "w") as f:
+        f.write(xml)
+    print(
+        f"[handsim-collision] injected {len(geoms)} static colliders from {config_path} "
+        f"at anchor ({anchor_xy[0]:.2f}, {anchor_xy[1]:.2f})",
+        flush=True,
+    )
+    return generated_path
 
 
 class DefaultEnv:
@@ -146,8 +371,9 @@ class DefaultEnv:
 
     def init_scene(self):
         """Initialize the default robot scene"""
-        xml_path = str(pathlib.Path(GEAR_SONIC_ROOT) / self.config["ROBOT_SCENE"])
-        self.mj_model = mujoco.MjModel.from_xml_path(xml_path)
+        xml_path = pathlib.Path(GEAR_SONIC_ROOT) / self.config["ROBOT_SCENE"]
+        xml_path = _inject_handsim_collision_scene(xml_path)
+        self.mj_model = mujoco.MjModel.from_xml_path(str(xml_path))
         self.mj_data = mujoco.MjData(self.mj_model)
         self.mj_model.opt.timestep = self.sim_dt
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
