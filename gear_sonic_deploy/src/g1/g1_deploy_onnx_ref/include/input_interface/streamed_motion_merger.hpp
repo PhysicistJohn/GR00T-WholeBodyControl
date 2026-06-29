@@ -3,7 +3,7 @@
  * @brief Reusable sliding-window merger for streamed motion data.
  *
  * StreamedMotionMerger receives chunks of motion frames (joint positions /
- * velocities, body quaternions, SMPL data) from any streaming source (ZMQ,
+ * velocities, body positions/quaternions, SMPL data) from any streaming source (ZMQ,
  * ROS2, etc.) and merges them into a single growing MotionSequence using a
  * sliding-window approach.
  *
@@ -85,7 +85,8 @@ public:
         std::vector<std::vector<double>> joint_pos;  ///< [frame][joint] positions (radians).
         std::vector<std::vector<double>> joint_vel;  ///< [frame][joint] velocities (rad/s).
         
-        // -- Body quaternions (required for all versions) --
+        // -- Body pose data (quaternions required for all versions; positions optional) --
+        std::vector<std::vector<std::array<double, 3>>> body_pos;   ///< [frame][body][x,y,z].
         std::vector<std::vector<std::array<double, 4>>> body_quat;  ///< [frame][body][w,x,y,z].
         
         // -- SMPL data (required in v2 & v3, optional in v1) --
@@ -100,6 +101,7 @@ public:
         // Derived dimensions (must match the vector sizes above)
         int num_frames = 0;       ///< Number of frames in this chunk.
         int num_joints = 0;       ///< Joints per frame (joint_pos / joint_vel width).
+        int num_pos_bodies = 0;   ///< Number of rigid bodies per frame (body_pos width).
         int num_quat_bodies = 0;  ///< Number of rigid bodies per frame (body_quat width).
         int num_smpl_joints = 0;  ///< SMPL joints per frame.
         int num_smpl_poses = 0;   ///< SMPL pose parameters per frame.
@@ -113,7 +115,7 @@ public:
     void Reset() {
         streamed_motion_ = std::make_shared<MotionSequence>();
         streamed_motion_->name = "streamed";
-        streamed_motion_->ReserveCapacity(15000, 29, 1, 1, 0, 0);
+        streamed_motion_->ReserveCapacity(15000, 29, 0, 1, 0, 0);
         stream_window_start_ = 0;
     }
     
@@ -350,7 +352,7 @@ private:
         new_motion->name = "streamed";
         
         int joints_to_reserve = data.num_joints;
-        int bodies_to_reserve = 1;
+        int bodies_to_reserve = data.num_pos_bodies;
         int body_quaternions_to_reserve = data.num_quat_bodies;
         int smpl_joints_to_reserve = data.num_smpl_joints;
         int smpl_poses_to_reserve = data.num_smpl_poses;
@@ -434,6 +436,18 @@ private:
                 }
             }
         }
+
+        // Copy body positions when the incoming stream carries root translation.
+        int old_pos_bodies = old_motion->GetNumBodies();
+        int pos_bodies_to_copy = std::min(data.num_pos_bodies, old_pos_bodies);
+        for (int i = 0; i < copy_count; ++i) {
+            for (int b = 0; b < pos_bodies_to_copy; ++b) {
+                for (int xyz = 0; xyz < 3; ++xyz) {
+                    new_motion->BodyPositions(copy_dst_idx + i)[b][xyz] =
+                        old_motion->BodyPositions(copy_src_idx + i)[b][xyz];
+                }
+            }
+        }
         
         // Copy SMPL data if present
         if (data.num_smpl_joints > 0 && old_motion->GetNumSmplJoints() > 0) {
@@ -486,6 +500,19 @@ private:
                 }
             }
         }
+
+        // Copy body positions if present. This carries the constrained root
+        // trajectory for streamed mocap clips.
+        if (!data.body_pos.empty()) {
+            for (int frame = 0; frame < data.num_frames; ++frame) {
+                for (int body = 0; body < data.num_pos_bodies; ++body) {
+                    for (int xyz = 0; xyz < 3; ++xyz) {
+                        motion->BodyPositions(dst_frame_offset + frame)[body][xyz] =
+                            data.body_pos[frame][body][xyz];
+                    }
+                }
+            }
+        }
         
         // Copy SMPL joints if present
         if (!data.smpl_joints.empty()) {
@@ -514,4 +541,3 @@ private:
 };
 
 #endif // STREAMED_MOTION_MERGER_HPP
-
