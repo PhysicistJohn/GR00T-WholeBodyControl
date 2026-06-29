@@ -133,6 +133,73 @@ def _box_geom(name: str, x: float, y: float, z: float, sx: float, sy: float, sz:
     )
 
 
+def _local_xy(x: float, y: float, yaw: float, lx: float, ly: float) -> tuple[float, float]:
+    c, s = math.cos(yaw), math.sin(yaw)
+    return x + c * lx - s * ly, y + s * lx + c * ly
+
+
+def _box_geom_local(
+    name: str,
+    x: float,
+    y: float,
+    yaw: float,
+    lx: float,
+    ly: float,
+    z: float,
+    sx: float,
+    sy: float,
+    sz: float,
+) -> str:
+    wx, wy = _local_xy(x, y, yaw, lx, ly)
+    return _box_geom(name, wx, wy, z, sx, sy, sz, yaw)
+
+
+def _shadow_half_extents(cfg: dict, default: tuple[float, float]) -> tuple[float, float]:
+    shadow = cfg.get("shadow", default)
+    if not isinstance(shadow, list | tuple) or len(shadow) < 2:
+        return default
+    return max(float(shadow[0]), 0.04), max(float(shadow[1]), 0.04)
+
+
+def _is_panel_like(raw_name: str, cfg: dict) -> bool:
+    label = f"{raw_name} {cfg.get('kind', '')} {cfg.get('model', '')}".lower()
+    return any(word in label for word in ("monitor", "display", "tv", "wall"))
+
+
+def _is_tabletop_prop(cfg: dict) -> bool:
+    return float(cfg.get("z", 0.0)) >= 0.35
+
+
+def _scene_object_proxy_geom(raw_name: str, cfg: dict, x: float, y: float, yaw: float, extents: tuple[float, float, float] | None = None) -> str:
+    key = "handsim_col_" + _safe_xml_name(str(raw_name)) + "_proxy"
+    scale = float(cfg.get("mesh_scale", cfg.get("scale", 1.0)))
+    base_z = float(cfg.get("z", 0.0))
+    sx, sy = _shadow_half_extents(cfg, (0.35, 0.25))
+    sx = max(sx * 0.92, 0.08)
+    sy = max(sy * 0.92, 0.08)
+
+    if _is_panel_like(str(raw_name), cfg):
+        sx = max(sx, 0.55 * scale)
+        sy = max(sy, 0.12)
+        sz = max(0.36 * scale, 0.45)
+        center_z = base_z if base_z >= 0.35 else max(sz, 1.05 * scale)
+    elif _is_tabletop_prop(cfg):
+        sz = max(0.05 * scale, 0.04)
+        center_z = base_z + sz
+    elif extents:
+        sx = max(sx, extents[0] * 0.45)
+        sy = max(sy, extents[1] * 0.45)
+        sz = max(extents[2] * 0.48, 0.10)
+        center_z = base_z + sz
+    else:
+        sz = max(0.12 * scale, 0.08)
+        if sx >= 0.45 or sy >= 0.45 or scale >= 2.0:
+            sz = max(sz, min(0.36 * scale, 1.45))
+        center_z = base_z + sz
+
+    return _box_geom(key, x, y, center_z, sx, sy, sz, yaw)
+
+
 def _capsule_geom(name: str, x: float, y: float, z: float, radius: float, half_height: float) -> str:
     return (
         f'      <geom name="{name}" type="capsule" '
@@ -248,21 +315,23 @@ def _handsim_collision_assets_and_geoms(scene: dict, repo: Path, anchor_xy: tupl
         elif kind == "wall":
             size = cfg.get("size", [1.0, 0.06])
             height = float(cfg.get("height", 1.5))
-            geoms.append(_box_geom(key, x, y, height * 0.5, float(size[0]), float(size[1]), height * 0.5, yaw))
+            sx = float(size[0]) if isinstance(size, list | tuple) and len(size) > 0 else 1.0
+            sy = float(size[1]) if isinstance(size, list | tuple) and len(size) > 1 else 0.06
+            geoms.append(_box_geom(key, x, y, height, sx, max(sy, 0.12), height, yaw))
         elif kind == "door_frame":
             s = scale
-            geoms.append(_box_geom(key + "_left", x - 0.86 * s, y, 1.05 * s, 0.055 * s, 0.10 * s, 1.05 * s, yaw))
-            geoms.append(_box_geom(key + "_right", x + 0.86 * s, y, 1.05 * s, 0.055 * s, 0.10 * s, 1.05 * s, yaw))
-            geoms.append(_box_geom(key + "_top", x, y, 2.07 * s, 0.92 * s, 0.10 * s, 0.07 * s, yaw))
+            geoms.append(_box_geom_local(key + "_left", x, y, yaw, -0.78 * s, 0.0, 1.35 * s, 0.08 * s, 0.10 * s, 1.35 * s))
+            geoms.append(_box_geom_local(key + "_right", x, y, yaw, 0.78 * s, 0.0, 1.35 * s, 0.08 * s, 0.10 * s, 1.35 * s))
+            geoms.append(_box_geom_local(key + "_top", x, y, yaw, 0.0, 0.0, 2.62 * s, 0.86 * s, 0.10 * s, 0.08 * s))
+            geoms.append(_box_geom_local(key + "_threshold", x, y, yaw, 0.0, -0.09 * s, 0.06 * s, 0.95 * s, 0.04 * s, 0.04 * s))
         elif kind == "booth":
             s = scale
-            geoms.append(_box_geom(key + "_back", x, y, 0.78 * s, 1.15 * s, 0.08 * s, 0.78 * s, yaw))
-            dx = math.cos(yaw + math.pi * 0.5) * 0.72 * s
-            dy = math.sin(yaw + math.pi * 0.5) * 0.72 * s
-            geoms.append(_box_geom(key + "_side", x + dx, y + dy, 0.72 * s, 0.08 * s, 0.78 * s, 0.72 * s, yaw))
+            geoms.append(_box_geom_local(key + "_back", x, y, yaw, 0.0, 0.92 * s, 1.10 * s, 1.55 * s, 0.09 * s, 1.10 * s))
+            geoms.append(_box_geom_local(key + "_side", x, y, yaw, -1.55 * s, 0.0, 1.10 * s, 0.09 * s, 0.90 * s, 1.10 * s))
+            geoms.append(_box_geom_local(key + "_front_rail", x, y, yaw, 0.0, 0.855 * s, 1.76 * s, 1.20 * s, 0.04 * s, 0.16 * s))
         elif kind == "instrument_rack":
             s = scale
-            geoms.append(_box_geom(key, x, y, 0.75 * s, 0.45 * s, 0.32 * s, 0.75 * s, yaw))
+            geoms.append(_box_geom(key, x, y, 0.84 * s, 0.62 * s, 0.34 * s, 0.78 * s, yaw))
         elif kind == "fence":
             length = float(cfg.get("length", 4.0)) * scale
             geoms.append(_box_geom(key, x, y, 0.45 * scale, length * 0.5, 0.055 * scale, 0.45 * scale, yaw))
@@ -272,15 +341,16 @@ def _handsim_collision_assets_and_geoms(scene: dict, repo: Path, anchor_xy: tupl
         elif kind == "abo":
             model_name = str(cfg.get("model", "")).strip()
             obj_path = _scene_mesh_path(repo, kind, model_name)
+            ext = _read_abo_extents(repo, str(cfg.get("model", "")), scale)
             if obj_path is not None and obj_path.exists():
                 mesh_name = "handsim_mesh_" + _safe_xml_name(str(raw_name))
                 assets.append(_mesh_collision_asset(mesh_name, obj_path, scale))
                 geoms.append(_mesh_collision_body(key, mesh_name, x, y, float(cfg.get("z", 0.0)), yaw))
+                geoms.append(_scene_object_proxy_geom(str(raw_name), cfg, x, y, yaw, ext))
                 continue
             shadow = cfg.get("shadow", [0.45, 0.35])
             if not isinstance(shadow, list | tuple) or len(shadow) < 2:
                 shadow = [0.45, 0.35]
-            ext = _read_abo_extents(repo, str(cfg.get("model", "")), scale)
             if ext:
                 sx = max(float(shadow[0]) * 0.65, ext[0] * 0.5)
                 sy = max(float(shadow[1]) * 0.65, ext[1] * 0.5)
@@ -297,6 +367,7 @@ def _handsim_collision_assets_and_geoms(scene: dict, repo: Path, anchor_xy: tupl
                 mesh_name = "handsim_mesh_" + _safe_xml_name(str(raw_name))
                 assets.append(_mesh_collision_asset(mesh_name, obj_path, scale))
                 geoms.append(_mesh_collision_body(key, mesh_name, x, y, float(cfg.get("z", 0.0)), yaw))
+                geoms.append(_scene_object_proxy_geom(str(raw_name), cfg, x, y, yaw))
                 continue
             shadow = cfg.get("shadow", [0.35, 0.25])
             if not isinstance(shadow, list | tuple) or len(shadow) < 2:
