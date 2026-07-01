@@ -25,6 +25,10 @@ dependencies = [
     "tqdm",
     "easydict",
     "loguru",
+    # Pub/sub + retained-state bus for handsim's "everything else" IPC
+    # (see unitree-g1-handsim/scripts/handsim_bus.py) — used by
+    # intent_planner_service.py and sim_render_service.py.
+    "redis>=5.0",
 ]
 license = {text = "Apache-2.0"}
 
