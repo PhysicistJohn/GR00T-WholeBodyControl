@@ -2754,30 +2754,45 @@ class G1Deploy {
      */
     void SanitizeLowCommand(LowCmd_& cmd) {
       int events = 0;
+      int last_joint = -1;
+      const char* last_kind = "";
+      float last_delta = 0.0f;
       const float max_q_step = Q_TARGET_SLEW_LIMIT * static_cast<float>(publish_dt_);
       for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
         auto& m = cmd.motor_cmd().at(i);
         float q = m.q();
         const float q_limited = std::min(std::max(q, q_lower_limits[i]), q_upper_limits[i]);
-        if (q_limited != q) { events++; q = q_limited; }
+        if (q_limited != q) {
+          events++; last_joint = i; last_kind = "qlim"; last_delta = q - q_limited;
+          q = q_limited;
+        }
         if (has_last_sent_q_target_) {
           const float step = q - last_sent_q_target_[i];
-          if (step > max_q_step) { q = last_sent_q_target_[i] + max_q_step; events++; }
-          else if (step < -max_q_step) { q = last_sent_q_target_[i] - max_q_step; events++; }
+          if (step > max_q_step) {
+            events++; last_joint = i; last_kind = "slew"; last_delta = step;
+            q = last_sent_q_target_[i] + max_q_step;
+          } else if (step < -max_q_step) {
+            events++; last_joint = i; last_kind = "slew"; last_delta = step;
+            q = last_sent_q_target_[i] - max_q_step;
+          }
         }
         m.q() = q;
         last_sent_q_target_[i] = q;
         const float tau = m.tau();
         const float tau_limited = std::min(std::max(tau, -tau_ff_limits[i]), tau_ff_limits[i]);
-        if (tau_limited != tau) { m.tau() = tau_limited; events++; }
+        if (tau_limited != tau) {
+          events++; last_joint = i; last_kind = "tau"; last_delta = tau - tau_limited;
+          m.tau() = tau_limited;
+        }
       }
       has_last_sent_q_target_ = true;
       if (events > 0) {
         sanitize_events_total_ += events;
         const auto now = std::chrono::steady_clock::now();
         if (now - last_sanitize_log_time_ > std::chrono::seconds(1)) {
-          std::cout << "[SANITIZE] clamped " << events << " command fields this tick ("
-                    << sanitize_events_total_ << " total since start)" << std::endl;
+          std::cout << "[SANITIZE] clamped " << events << " field(s) this tick, last: joint "
+                    << last_joint << " " << last_kind << " excess " << last_delta
+                    << " (" << sanitize_events_total_ << " total)" << std::endl;
           last_sanitize_log_time_ = now;
         }
       }
