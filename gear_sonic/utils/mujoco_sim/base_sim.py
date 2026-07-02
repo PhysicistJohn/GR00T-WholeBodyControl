@@ -694,10 +694,13 @@ class DefaultEnv:
 
     def get_head_pose(self) -> np.ndarray:
         root_pos = self.mj_data.body("torso_link").xpos.copy()
-        # Reorder quaternion from MuJoCo [w,x,y,z] to scipy [x,y,z,w]
-        root_quat = self.mj_data.body("torso_link").xquat.copy()[[1, 2, 3, 0]]
-        head_pos = root_pos + Rotation.from_quat(root_quat).apply(np.array([0.0, 0.0, -0.044]))
-        return np.concatenate((head_pos, root_quat))
+        root_quat_wxyz = self.mj_data.body("torso_link").xquat.copy()
+        # scipy Rotation needs [x,y,z,w]; every other quaternion in this module
+        # (rt/lowstate imu_state, rt/secondary_imu) stays MuJoCo-native [w,x,y,z],
+        # so convert back before returning instead of leaking the scipy order out.
+        root_quat_xyzw = root_quat_wxyz[[1, 2, 3, 0]]
+        head_pos = root_pos + Rotation.from_quat(root_quat_xyzw).apply(np.array([0.0, 0.0, -0.044]))
+        return np.concatenate((head_pos, root_quat_wxyz))
 
     def get_root_vel(self) -> np.ndarray:
         return self.mj_data.qvel[:6]
