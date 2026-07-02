@@ -2,6 +2,7 @@
 
 import multiprocessing as mp
 from multiprocessing import shared_memory
+import random
 import time
 from typing import Any, Dict
 
@@ -28,11 +29,23 @@ class ImagePublishProcess:
         zmq_port: int = 5555,
         start_method: str = "spawn",
         verbose: bool = False,
+        latency_ms: float = 0.0,
+        jitter_ms: float = 0.0,
+        drop_prob: float = 0.0,
     ):
         self.camera_configs = camera_configs
         self.image_dt = image_dt
         self.zmq_port = zmq_port
         self.verbose = verbose
+        # Transport-realism knobs: real network transport isn't zero-latency/
+        # lossless the way this in-process ZMQ link is. All default to 0 (off,
+        # identical to prior behavior); set at process start only -- these are
+        # baked into the subprocess's args tuple at spawn time, not a live
+        # per-tick config like SENSOR_NOISE_* (would need a subprocess restart
+        # to change, unlike an in-process poll).
+        self.latency_ms = latency_ms
+        self.jitter_ms = jitter_ms
+        self.drop_prob = drop_prob
         self.shared_memory_blocks = {}
         self.shared_memory_info = {}
         self.process = None
@@ -72,6 +85,9 @@ class ImagePublishProcess:
                 self.stop_event,
                 self.data_ready_event,
                 self.verbose,
+                self.latency_ms,
+                self.jitter_ms,
+                self.drop_prob,
             ),
         )
         self.process.start()
@@ -124,7 +140,8 @@ class ImagePublishProcess:
 
     @staticmethod
     def _image_publish_worker(
-        shared_memory_info, image_dt, zmq_port, stop_event, data_ready_event, verbose
+        shared_memory_info, image_dt, zmq_port, stop_event, data_ready_event, verbose,
+        latency_ms=0.0, jitter_ms=0.0, drop_prob=0.0,
     ):
         """Worker function that runs in the subprocess"""
         try:
@@ -182,7 +199,19 @@ class ImagePublishProcess:
                         for camera_name, image_copy in image_copies.items():
                             serialized_data[f"{camera_name}"] = ImageUtils.encode_image(image_copy)
 
-                        sensor_server.send_message(serialized_data)
+                        # Transport realism: real network transport isn't
+                        # zero-latency/lossless the way this in-process ZMQ
+                        # link is. All no-ops when the *_ms/prob args are 0
+                        # (the default), so this subprocess's own send timing
+                        # is unaffected unless explicitly configured.
+                        if drop_prob > 0.0 and random.random() < drop_prob:
+                            pass
+                        else:
+                            if latency_ms > 0.0 or jitter_ms > 0.0:
+                                delay = max(0.0, latency_ms + random.uniform(-jitter_ms, jitter_ms))
+                                if delay > 0.0:
+                                    time.sleep(delay / 1000.0)
+                            sensor_server.send_message(serialized_data)
 
                     except Exception as e:
                         print(f"Error publishing images: {e}")

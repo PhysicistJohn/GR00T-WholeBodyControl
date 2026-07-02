@@ -518,6 +518,9 @@ class DefaultEnv:
             zmq_port=camera_port,
             start_method=start_method,
             verbose=self.config.get("verbose", False),
+            latency_ms=float(self.config.get("TRANSPORT_LATENCY_MS", 0.0)),
+            jitter_ms=float(self.config.get("TRANSPORT_JITTER_MS", 0.0)),
+            drop_prob=float(self.config.get("TRANSPORT_DROP_PROB", 0.0)),
         )
         self.image_publish_process.start_process()
 
