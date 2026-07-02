@@ -2757,7 +2757,12 @@ class G1Deploy {
       int last_joint = -1;
       const char* last_kind = "";
       float last_delta = 0.0f;
-      const float max_q_step = Q_TARGET_SLEW_LIMIT * static_cast<float>(publish_dt_);
+      // Targets update at the 50 Hz control tick but are re-sent at the 500 Hz
+      // writer, so a smooth 35 rad/s trajectory legitimately arrives as one
+      // control_dt-sized step between otherwise-identical writer ticks. Budget
+      // per writer tick = one control period of Q_TARGET_SLEW_LIMIT motion;
+      // nominal gait steps (~0.1-0.3 rad) pass, NaN/unit-error jumps (rad+) don't.
+      const float max_q_step = Q_TARGET_SLEW_LIMIT * static_cast<float>(control_dt_);
       for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
         auto& m = cmd.motor_cmd().at(i);
         float q = m.q();
