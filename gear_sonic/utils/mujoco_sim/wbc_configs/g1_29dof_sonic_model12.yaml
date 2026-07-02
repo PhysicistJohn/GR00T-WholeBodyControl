@@ -22,6 +22,18 @@ ENABLE_ELASTIC_BAND: True # [MULTI-48] band holds robot at standing height throu
 SIMULATE_DT: 0.005  # Need to be larger than the runtime of viewer.sync()
 VIEWER_DT: 0.02  # Viewer update time
 REWARD_DT: 0.02
+
+# Optional sensor-noise layer (default off, bit-identical to before when
+# false). No real noise-magnitude spec exists for this robot -- these are
+# conservative placeholders, tune as needed. SENSOR_NOISE_SEED unset = random.
+SENSOR_NOISE_ENABLE: False
+# SENSOR_NOISE_SEED: 0
+# SENSOR_NOISE_JOINT_POS_STD: 0.001    # rad
+# SENSOR_NOISE_JOINT_VEL_STD: 0.01     # rad/s
+# SENSOR_NOISE_IMU_QUAT_STD: 0.001     # rad, per-step small-angle noise
+# SENSOR_NOISE_IMU_QUAT_BIAS_STD: 0.002  # rad, fixed per-episode bias (resampled on reset)
+# SENSOR_NOISE_IMU_VEL_STD: 0.01       # m/s and rad/s (mixed units, approximate)
+# SENSOR_NOISE_CAMERA_STD: 2.0         # uint8 pixel-intensity Gaussian noise
 USE_SENSOR: False
 USE_HISTORY: True
 USE_HISTORY_LOCO: True

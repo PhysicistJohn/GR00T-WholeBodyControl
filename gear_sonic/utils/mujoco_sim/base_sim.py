@@ -453,6 +453,23 @@ class DefaultEnv:
         self.obs = None
         self.torques = np.zeros(self.num_body_dof + self.num_hand_dof * 2)
         self.torque_limit = np.array(self.robot.MOTOR_EFFORT_LIMIT_LIST)
+
+        # Optional sensor-noise layer (default off): the sim is otherwise
+        # ground-truth-perfect on IMU/encoders/camera every step, which is
+        # unrealistic and (if this ever feeds training/eval) hides sim2real
+        # brittleness. No real noise-magnitude spec exists in this repo, so
+        # these are conservative placeholders, not measured values.
+        self.sensor_noise_enable = bool(self.config.get("SENSOR_NOISE_ENABLE", False))
+        self._noise_rng = np.random.default_rng(self.config.get("SENSOR_NOISE_SEED"))
+        self._joint_pos_noise_std = float(self.config.get("SENSOR_NOISE_JOINT_POS_STD", 0.001))
+        self._joint_vel_noise_std = float(self.config.get("SENSOR_NOISE_JOINT_VEL_STD", 0.01))
+        self._imu_quat_noise_std = float(self.config.get("SENSOR_NOISE_IMU_QUAT_STD", 0.001))
+        self._imu_quat_bias_std = float(self.config.get("SENSOR_NOISE_IMU_QUAT_BIAS_STD", 0.002))
+        self._imu_vel_noise_std = float(self.config.get("SENSOR_NOISE_IMU_VEL_STD", 0.01))
+        self._camera_noise_std = float(self.config.get("SENSOR_NOISE_CAMERA_STD", 2.0))
+        self._imu_quat_bias_rotvec = np.zeros(3)
+        if self.sensor_noise_enable:
+            self._resample_imu_bias()
         self.camera_configs = camera_configs
 
         if not camera_configs and offscreen and enable_image_publish:
@@ -790,6 +807,23 @@ class DefaultEnv:
             obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
             obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + self.qvel_offset - 1]
             obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
+
+        if self.sensor_noise_enable:
+            rng = self._noise_rng
+            imu_rotvec = self._imu_quat_bias_rotvec + rng.normal(0.0, self._imu_quat_noise_std, size=3)
+            obs["secondary_imu_quat"] = self._apply_small_rotation_wxyz(
+                obs["secondary_imu_quat"], imu_rotvec
+            )
+            obs["secondary_imu_vel"] = obs["secondary_imu_vel"] + rng.normal(
+                0.0, self._imu_vel_noise_std, size=6
+            )
+            obs["body_q"] = obs["body_q"] + rng.normal(0.0, self._joint_pos_noise_std, size=obs["body_q"].shape)
+            obs["body_dq"] = obs["body_dq"] + rng.normal(0.0, self._joint_vel_noise_std, size=obs["body_dq"].shape)
+            if self.num_hand_dof > 0:
+                for side in ("left_hand_q", "right_hand_q"):
+                    obs[side] = obs[side] + rng.normal(0.0, self._joint_pos_noise_std, size=obs[side].shape)
+                for side in ("left_hand_dq", "right_hand_dq"):
+                    obs[side] = obs[side] + rng.normal(0.0, self._joint_vel_noise_std, size=obs[side].shape)
             obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
         obs["time"] = self.mj_data.time
         return obs
@@ -908,7 +942,11 @@ class DefaultEnv:
                 renderer.update_scene(self.mj_data, camera=camera_config["mjcf_name"])
             else:
                 renderer.update_scene(self.mj_data, camera=camera_name)
-            render_caches[camera_name + "_image"] = renderer.render()
+            image = renderer.render()
+            if self.sensor_noise_enable:
+                noise = self._noise_rng.normal(0.0, self._camera_noise_std, size=image.shape)
+                image = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
+            render_caches[camera_name + "_image"] = image
 
         if self.image_publish_process is not None:
             self.image_publish_process.update_shared_memory(render_caches)
@@ -944,8 +982,33 @@ class DefaultEnv:
             print(f"Warning: Self-collision detected: {contact_bodies}")
         return self_collision
 
+    def _resample_imu_bias(self):
+        """Resample the per-episode fixed IMU orientation bias (small-angle rotvec, rad)."""
+        self._imu_quat_bias_rotvec = self._noise_rng.normal(0.0, self._imu_quat_bias_std, size=3)
+
+    @staticmethod
+    def _apply_small_rotation_wxyz(quat_wxyz: np.ndarray, rotvec: np.ndarray) -> np.ndarray:
+        """Return quat_wxyz rotated by a small-angle rotvec (rad), left-multiplied. Non-destructive."""
+        angle = np.linalg.norm(rotvec)
+        if angle < 1e-12:
+            return quat_wxyz.copy()
+        axis = rotvec / angle
+        half = angle * 0.5
+        delta = np.array([np.cos(half), *(axis * np.sin(half))])
+        w0, x0, y0, z0 = delta
+        w1, x1, y1, z1 = quat_wxyz
+        out = np.array([
+            w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1,
+            w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1,
+            w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1,
+            w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1,
+        ])
+        return out / np.linalg.norm(out)
+
     def reset(self):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
+        if self.sensor_noise_enable:
+            self._resample_imu_bias()
 
 
 class BaseSimulator:
