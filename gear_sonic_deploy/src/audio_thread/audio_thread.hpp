@@ -10,6 +10,7 @@ struct AudioCommand {
   bool streaming_data_absent = false;
   bool motor_error = false;
   bool low_state_late = false;
+  bool token_stale = false;
   std::string tts_message;  // One-shot TTS message (spoken once when non-empty)
   bool high_temperature = false;             // Continuous warning while true
   std::string high_temperature_message;      // Spoken every poll while high_temperature is true

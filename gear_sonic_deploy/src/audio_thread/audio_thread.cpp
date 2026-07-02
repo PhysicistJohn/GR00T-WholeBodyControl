@@ -6,6 +6,7 @@ static const std::string POSE_MODE = "Pose mode";
 static const std::string WARNING_STREAMING_DATA_ABSENT = "Streaming data absent";
 static const std::string WARNING_MOTOR_ERROR = "Motor error detected";
 static const std::string WARNING_LOW_STATE_LATE = "ROBOT DATA LATE";
+static const std::string WARNING_TOKEN_STALE = "Motion token stream stale";
 
 AudioThread::AudioThread():
   client_() {
@@ -56,6 +57,9 @@ void AudioThread::loop(std::stop_token st) {
     }
     if (command.low_state_late && !command_last_.low_state_late) {
       client_.TtsMaker(WARNING_LOW_STATE_LATE, 1);
+    }
+    if (command.token_stale && !command_last_.token_stale) {
+      client_.TtsMaker(WARNING_TOKEN_STALE, 1);
     }
 
     command_last_ = command;

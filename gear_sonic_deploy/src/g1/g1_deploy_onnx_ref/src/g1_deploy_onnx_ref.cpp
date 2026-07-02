@@ -305,6 +305,7 @@ class G1Deploy {
 
     static constexpr std::chrono::milliseconds STREAMING_DATA_ABSENT_THRESHOLD{150};
     CounterDebouncer streaming_data_absent_debouncer_{100, 500, 50, 1};
+    CounterDebouncer token_stale_debouncer_{100, 500, 50, 1};
     RollingStats<1000> streaming_data_delay_rolling_stats_;
     std::unique_ptr<AudioThread> audio_thread_;
     
@@ -3119,11 +3120,22 @@ class G1Deploy {
       auto low_state_data = low_state_buffer_.GetDataWithTime();
       bool low_state_late = (std::chrono::steady_clock::now() - low_state_data.timestamp) > LOW_STATE_LATE_THRESHOLD;
 
+      // Motion-token freshness: same debounced-warning treatment as the other
+      // input-staleness signals above. This surfaces "SONIC is running on a
+      // frozen token" loudly instead of only a console log (see the
+      // "Don't pause - just warn" token-timeout handling further below,
+      // which still holds the last received tokens rather than damping —
+      // that motor-output behavior is unchanged here, this only adds signal).
+      bool token_stale = first_token_received_ && last_token_time_.has_value()
+          && (std::chrono::steady_clock::now() - last_token_time_.value()) > TOKEN_TIMEOUT_MS;
+      token_stale_debouncer_.update(token_stale);
+
       audio_thread_->SetCommand(
         AudioCommand{
           .streaming_data_absent = streaming_data_absent_debouncer_.state(),
           .motor_error = error_monitor_.hasErrors(),
           .low_state_late = low_state_late,
+          .token_stale = token_stale_debouncer_.state(),
           .tts_message = std::move(pending_tts_),
           .high_temperature = high_temp_warning_,
           .high_temperature_message = high_temp_message_,
