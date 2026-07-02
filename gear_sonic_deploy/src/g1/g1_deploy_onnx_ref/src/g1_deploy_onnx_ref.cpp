@@ -2761,7 +2761,8 @@ class G1Deploy {
       for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
         auto& m = cmd.motor_cmd().at(i);
         float q = m.q();
-        const float q_limited = std::min(std::max(q, q_lower_limits[i]), q_upper_limits[i]);
+        const float q_limited = std::min(std::max(q, q_lower_limits[i] - Q_SANITIZE_MARGIN),
+                                         q_upper_limits[i] + Q_SANITIZE_MARGIN);
         if (q_limited != q) {
           events++; last_joint = i; last_kind = "qlim"; last_delta = q - q_limited;
           q = q_limited;

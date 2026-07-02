@@ -291,6 +291,14 @@ const std::array<float, 29> tau_ff_limits = {
 // output becomes a bounded ramp instead of a full-stiffness PD step.
 const float Q_TARGET_SLEW_LIMIT = 35.0f;
 
+// Margin beyond the joint limits before the sanitizer clamps q_target.
+// The SONIC policy INTENTIONALLY commands past-limit targets as PD torque
+// shaping (observed nominal excess up to ~0.7 rad on waist_pitch); the
+// joint physically stops at its range, the over-command just saturates
+// torque toward it. The sanitizer must pass that idiom untouched and only
+// catch insanity (NaN blowups, unit errors, runaway outputs).
+const float Q_SANITIZE_MARGIN = 1.0f;
+
 // Default joint angles (standing pose)
 const std::array<double, 29> default_angles = {
     -0.312, // left_hip_pitch_joint
