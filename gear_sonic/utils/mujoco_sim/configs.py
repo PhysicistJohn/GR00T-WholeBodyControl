@@ -136,8 +136,10 @@ class BaseConfig(ArgsConfigTemplate):
     control_frequency: int = 50
     """Frequency of the control loop."""
 
-    sim_frequency: int = 200
-    """Frequency of the simulation loop."""
+    sim_frequency: int = 500
+    """Frequency of the simulation loop. 500Hz matches the real robot's
+    control-loop cadence (was 200Hz) -- see the SIMULATE_DT comment in
+    g1_29dof_sonic_model12.yaml for the headroom measurement backing this."""
 
     # Robot Configuration
     enable_waist: bool = True
