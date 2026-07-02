@@ -252,7 +252,19 @@ class G1Deploy {
     // =========================================================================
     // Flag to disable CRC checking for MuJoCo simulation
     bool disable_crc_check_ = false;
-    
+
+    // Measured-velocity abort (body_dq > 35 rad/s). Historically gated on
+    // disable_crc_check_, which silently disabled it in sim; now independent
+    // so sim exercises the same guard as hardware (--disable-velocity-guard).
+    bool disable_velocity_guard_ = false;
+
+    // Command-sanitizer state (see SanitizeLowCommand): last q_target actually
+    // published, for slew-rate limiting across writer ticks.
+    std::array<float, G1_NUM_MOTOR> last_sent_q_target_{};
+    bool has_last_sent_q_target_ = false;
+    uint64_t sanitize_events_total_ = 0;
+    std::chrono::steady_clock::time_point last_sanitize_log_time_{};
+
     bool reinitialize_heading_ = true;
     bool report_temperature_ = false;
     std::string pending_tts_;  // One-shot TTS message, consumed by GatherInputInterfaceData()
@@ -2600,6 +2612,14 @@ class G1Deploy {
       SetThreadPriority();
     }
 
+    /// Disable the body_dq > 35 rad/s abort (bench/debug only; never on hardware).
+    void SetDisableVelocityGuard(bool disable) {
+      disable_velocity_guard_ = disable;
+      if (disable) {
+        std::cout << "[WARN] body velocity guard DISABLED (--disable-velocity-guard)" << std::endl;
+      }
+    }
+
     ~G1Deploy()
     {
       hot_reload_stop_.store(true);
@@ -2722,6 +2742,47 @@ class G1Deploy {
     }
 
     /**
+     * @brief Final command sanitizer before DDS publish (defense in depth).
+     *
+     * Runs at the 500 Hz writer on whatever any producer (init ramp, policy,
+     * damping) placed in the buffer: clamps q_target to the MJCF joint limits,
+     * slew-limits q_target to Q_TARGET_SLEW_LIMIT so a discontinuous target
+     * becomes a bounded ramp instead of a full-stiffness PD step, and clamps
+     * tau feedforward to the motor effort ceiling. Clamp events are counted
+     * and logged at most once per second. Must never bind in nominal motion.
+     */
+    void SanitizeLowCommand(LowCmd_& cmd) {
+      int events = 0;
+      const float max_q_step = Q_TARGET_SLEW_LIMIT * static_cast<float>(publish_dt_);
+      for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
+        auto& m = cmd.motor_cmd().at(i);
+        float q = m.q();
+        const float q_limited = std::min(std::max(q, q_lower_limits[i]), q_upper_limits[i]);
+        if (q_limited != q) { events++; q = q_limited; }
+        if (has_last_sent_q_target_) {
+          const float step = q - last_sent_q_target_[i];
+          if (step > max_q_step) { q = last_sent_q_target_[i] + max_q_step; events++; }
+          else if (step < -max_q_step) { q = last_sent_q_target_[i] - max_q_step; events++; }
+        }
+        m.q() = q;
+        last_sent_q_target_[i] = q;
+        const float tau = m.tau();
+        const float tau_limited = std::min(std::max(tau, -tau_ff_limits[i]), tau_ff_limits[i]);
+        if (tau_limited != tau) { m.tau() = tau_limited; events++; }
+      }
+      has_last_sent_q_target_ = true;
+      if (events > 0) {
+        sanitize_events_total_ += events;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_sanitize_log_time_ > std::chrono::seconds(1)) {
+          std::cout << "[SANITIZE] clamped " << events << " command fields this tick ("
+                    << sanitize_events_total_ << " total since start)" << std::endl;
+          last_sanitize_log_time_ = now;
+        }
+      }
+    }
+
+    /**
      * @brief Command-writer thread body (500 Hz).
      *
      * Reads the latest MotorCommand from motor_command_buffer_, packs it
@@ -2743,6 +2804,8 @@ class G1Deploy {
           dds_low_command.motor_cmd().at(i).kp() = mc->kp.at(i);
           dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i);
         }
+
+        SanitizeLowCommand(dds_low_command);
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
         lowcmd_publisher_->Write(dds_low_command);
@@ -2899,7 +2962,7 @@ class G1Deploy {
         body_q[i] =
             unitree_joint_state[mujoco_to_isaaclab[i]].q() - default_angles[mujoco_to_isaaclab[i]]; // URDF order
         body_dq[i] = unitree_joint_state[mujoco_to_isaaclab[i]].dq(); // URDF order
-        if (body_dq[i] > 35 && !disable_crc_check_) {
+        if (body_dq[i] > 35 && !disable_velocity_guard_) {
           std::cout << "✗ Error: body_dq[" << i << "] = " << body_dq[i] << " > 35."
                     << std::endl;
           return false;
@@ -4211,6 +4274,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
+    std::cout << "  --disable-velocity-guard: disable the body_dq > 35 rad/s abort (bench/debug only)" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
@@ -4251,6 +4315,7 @@ int main(int argc, char const* argv[]) {
 
   // Parse optional arguments
   bool disableCrcCheck = false;\
+  bool disableVelocityGuard = false;
   std::string obsConfigPath = "";
   std::string encoderFile = "";
   std::string targetMotionLogfile = "";
@@ -4278,6 +4343,8 @@ int main(int argc, char const* argv[]) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--disable-velocity-guard") {
+      disableVelocityGuard = true;
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4537,6 +4604,7 @@ int main(int argc, char const* argv[]) {
     initial_compliance,
     initial_max_close_ratio
   );
+  custom.SetDisableVelocityGuard(disableVelocityGuard);
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
   // Main application loop - check both operator_state.stop and ROS2 status if using ROS2

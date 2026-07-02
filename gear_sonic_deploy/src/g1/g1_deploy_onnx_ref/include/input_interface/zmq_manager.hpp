@@ -549,7 +549,10 @@ class ZMQManager : public InputInterface {
         operator_state.start = true;
         {
           std::lock_guard<std::mutex> lock(current_motion_mutex);
-          operator_state.play = true;
+          // Do NOT force play here: with IDLE intent, CONTROL balance-holds
+          // frame 0 of the reference motion (upstream start/play semantics).
+          // Every path that needs playback sets play itself: the planner
+          // paths below after planner_motion is live, and hot-reload.
           reinitialize_heading = true;
         }
 
@@ -570,7 +573,7 @@ class ZMQManager : public InputInterface {
         // grounded in headless sim, so defer planner startup until the first
         // non-IDLE intent arrives.
         if (!should_enable_planner) {
-          std::cout << "[ZMQManager] CONTROL started on reference motion; planner deferred until non-IDLE intent" << std::endl;
+          std::cout << "[ZMQManager] CONTROL balance-holding reference frame 0; planner deferred until non-IDLE intent" << std::endl;
           return;
         }
 

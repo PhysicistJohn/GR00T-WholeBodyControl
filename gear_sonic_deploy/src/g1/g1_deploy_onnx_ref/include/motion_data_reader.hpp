@@ -29,6 +29,7 @@
 #ifndef MOTION_DATA_READER_HPP
 #define MOTION_DATA_READER_HPP
 
+#include <algorithm>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -695,6 +696,10 @@ class MotionDataReader {
         std::cerr << "Error reading directory: " << e.what() << std::endl;
         return false;
       }
+
+      // directory_iterator order is filesystem-dependent; sort so motion index 0
+      // (the boot/default reference) is deterministic across hosts.
+      std::sort(motion_names.begin(), motion_names.end());
 
       std::cout << "Found " << motion_names.size() << " motion folders" << std::endl;
 

@@ -238,7 +238,10 @@ INTERFACE_MODE="real"
 CHECKPOINT_DEFAULT="policy/release/model"
 OBS_CONFIG_DEFAULT="policy/release/observation_config.yaml"
 PLANNER_DEFAULT="planner/target_vel/V2/planner_sonic.onnx"
-MOTION_DATA_DEFAULT="reference/example/"
+# Neutral stand-still boot library: motion index 0 must never be a dynamic
+# clip (a gantry-hung real robot playing a dance at policy-engage is unsafe).
+# Pass --motion-data reference/example/ explicitly to use the demo clips.
+MOTION_DATA_DEFAULT="reference/boot_stand/"
 INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
 ZMQ_HOST_DEFAULT="localhost"

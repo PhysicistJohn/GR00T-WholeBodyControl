@@ -206,6 +206,91 @@ const std::array<float, 29> kds = {
     DAMPING_4010, // right_wrist_yaw_joint
 };
 
+// Joint position limits (rad), hardware motor order, extracted from
+// g1/g1_29dof.xml joint ranges. Used to clamp q_target before rt/lowcmd.
+const std::array<float, 29> q_lower_limits = {
+    -2.5307f,   // left_hip_pitch_joint
+    -0.5236f,   // left_hip_roll_joint
+    -2.7576f,   // left_hip_yaw_joint
+    -0.087267f, // left_knee_joint
+    -0.87267f,  // left_ankle_pitch_joint
+    -0.2618f,   // left_ankle_roll_joint
+    -2.5307f,   // right_hip_pitch_joint
+    -2.9671f,   // right_hip_roll_joint
+    -2.7576f,   // right_hip_yaw_joint
+    -0.087267f, // right_knee_joint
+    -0.87267f,  // right_ankle_pitch_joint
+    -0.2618f,   // right_ankle_roll_joint
+    -2.618f,    // waist_yaw_joint
+    -0.52f,     // waist_roll_joint
+    -0.52f,     // waist_pitch_joint
+    -3.0892f,   // left_shoulder_pitch_joint
+    -1.5882f,   // left_shoulder_roll_joint
+    -2.618f,    // left_shoulder_yaw_joint
+    -1.0472f,   // left_elbow_joint
+    -1.97222f,  // left_wrist_roll_joint
+    -1.61443f,  // left_wrist_pitch_joint
+    -1.61443f,  // left_wrist_yaw_joint
+    -3.0892f,   // right_shoulder_pitch_joint
+    -2.2515f,   // right_shoulder_roll_joint
+    -2.618f,    // right_shoulder_yaw_joint
+    -1.0472f,   // right_elbow_joint
+    -1.97222f,  // right_wrist_roll_joint
+    -1.61443f,  // right_wrist_pitch_joint
+    -1.61443f,  // right_wrist_yaw_joint
+};
+
+const std::array<float, 29> q_upper_limits = {
+    2.8798f,    // left_hip_pitch_joint
+    2.9671f,    // left_hip_roll_joint
+    2.7576f,    // left_hip_yaw_joint
+    2.8798f,    // left_knee_joint
+    0.5236f,    // left_ankle_pitch_joint
+    0.2618f,    // left_ankle_roll_joint
+    2.8798f,    // right_hip_pitch_joint
+    0.5236f,    // right_hip_roll_joint
+    2.7576f,    // right_hip_yaw_joint
+    2.8798f,    // right_knee_joint
+    0.5236f,    // right_ankle_pitch_joint
+    0.2618f,    // right_ankle_roll_joint
+    2.618f,     // waist_yaw_joint
+    0.52f,      // waist_roll_joint
+    0.52f,      // waist_pitch_joint
+    2.6704f,    // left_shoulder_pitch_joint
+    2.2515f,    // left_shoulder_roll_joint
+    2.618f,     // left_shoulder_yaw_joint
+    2.0944f,    // left_elbow_joint
+    1.97222f,   // left_wrist_roll_joint
+    1.61443f,   // left_wrist_pitch_joint
+    1.61443f,   // left_wrist_yaw_joint
+    2.6704f,    // right_shoulder_pitch_joint
+    1.5882f,    // right_shoulder_roll_joint
+    2.618f,     // right_shoulder_yaw_joint
+    2.0944f,    // right_elbow_joint
+    1.97222f,   // right_wrist_roll_joint
+    1.61443f,   // right_wrist_pitch_joint
+    1.61443f,   // right_wrist_yaw_joint
+};
+
+// Feedforward torque ceiling per joint (Nm), mirroring the motor-family
+// mapping of the gain tables (ankles/waist roll+pitch are dual-5020).
+const std::array<float, 29> tau_ff_limits = {
+    EFFORT_LIMIT_7520_22, EFFORT_LIMIT_7520_22, EFFORT_LIMIT_7520_14,
+    EFFORT_LIMIT_7520_22, 2.0 * EFFORT_LIMIT_5020, 2.0 * EFFORT_LIMIT_5020,
+    EFFORT_LIMIT_7520_22, EFFORT_LIMIT_7520_22, EFFORT_LIMIT_7520_14,
+    EFFORT_LIMIT_7520_22, 2.0 * EFFORT_LIMIT_5020, 2.0 * EFFORT_LIMIT_5020,
+    EFFORT_LIMIT_7520_14, 2.0 * EFFORT_LIMIT_5020, 2.0 * EFFORT_LIMIT_5020,
+    EFFORT_LIMIT_5020, EFFORT_LIMIT_5020, EFFORT_LIMIT_5020,
+    EFFORT_LIMIT_5020, EFFORT_LIMIT_5020, EFFORT_LIMIT_4010, EFFORT_LIMIT_4010,
+    EFFORT_LIMIT_5020, EFFORT_LIMIT_5020, EFFORT_LIMIT_5020,
+    EFFORT_LIMIT_5020, EFFORT_LIMIT_5020, EFFORT_LIMIT_4010, EFFORT_LIMIT_4010,
+};
+
+// Max q_target slew rate (rad/s) at the 500 Hz command writer. Matches the
+// 35 rad/s measured-velocity abort in CheckSafety: a discontinuous policy
+// output becomes a bounded ramp instead of a full-stiffness PD step.
+const float Q_TARGET_SLEW_LIMIT = 35.0f;
+
 // Default joint angles (standing pose)
 const std::array<double, 29> default_angles = {
     -0.312, // left_hip_pitch_joint
