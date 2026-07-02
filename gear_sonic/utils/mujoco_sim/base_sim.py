@@ -29,6 +29,16 @@ from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
 from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
 from gear_sonic.utils.mujoco_sim.robot import Robot
 
+try:
+    # Optional: lets the console live-tune SENSOR_NOISE_* without a restart.
+    # Not a hard dependency -- handsim_bus lives in the sibling unitree-g1-handsim
+    # repo (importable in the deployed container via PYTHONPATH; may be absent
+    # in standalone/test invocations of this module, which is fine -- settings
+    # just stay at their static config values).
+    import handsim_bus
+except ImportError:
+    handsim_bus = None
+
 GEAR_SONIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 
@@ -470,6 +480,9 @@ class DefaultEnv:
         self._imu_quat_bias_rotvec = np.zeros(3)
         if self.sensor_noise_enable:
             self._resample_imu_bias()
+        self._settings_poll_interval = 0.5  # seconds; avoid hammering redis at physics rate
+        self._last_settings_poll = 0.0
+        self._poll_live_settings(force=True)
         self.camera_configs = camera_configs
 
         if not camera_configs and offscreen and enable_image_publish:
@@ -771,6 +784,7 @@ class DefaultEnv:
         return hand_qpos
 
     def prepare_obs(self) -> Dict[str, any]:
+        self._poll_live_settings()
         obs = {}
         if self.use_floating_root_link:
             obs["floating_base_pose"] = self.mj_data.qpos[:7]
@@ -985,6 +999,33 @@ class DefaultEnv:
     def _resample_imu_bias(self):
         """Resample the per-episode fixed IMU orientation bias (small-angle rotvec, rad)."""
         self._imu_quat_bias_rotvec = self._noise_rng.normal(0.0, self._imu_quat_bias_std, size=3)
+
+    def _poll_live_settings(self, force: bool = False):
+        """Pull live-tunable sensor-noise settings from the console (handsim_bus),
+        throttled to avoid a redis round-trip every physics tick. Fail-safe: any
+        error (redis down, bad payload) just keeps the last-known values -- this
+        is a nice-to-have, not safety-critical, and must never disrupt the sim
+        loop. imu_quat_bias_std only takes effect on the next reset (the bias
+        itself is meant to stay fixed for an episode, not jitter mid-run)."""
+        if handsim_bus is None:
+            return
+        now = time.time()
+        if not force and (now - self._last_settings_poll) < self._settings_poll_interval:
+            return
+        self._last_settings_poll = now
+        try:
+            settings = handsim_bus.read_state(handsim_bus.SIM_SETTINGS)
+        except Exception:
+            return
+        if not settings:
+            return
+        self.sensor_noise_enable = bool(settings.get("sensor_noise_enable", self.sensor_noise_enable))
+        self._joint_pos_noise_std = float(settings.get("joint_pos_std", self._joint_pos_noise_std))
+        self._joint_vel_noise_std = float(settings.get("joint_vel_std", self._joint_vel_noise_std))
+        self._imu_quat_noise_std = float(settings.get("imu_quat_std", self._imu_quat_noise_std))
+        self._imu_quat_bias_std = float(settings.get("imu_quat_bias_std", self._imu_quat_bias_std))
+        self._imu_vel_noise_std = float(settings.get("imu_vel_std", self._imu_vel_noise_std))
+        self._camera_noise_std = float(settings.get("camera_std", self._camera_noise_std))
 
     @staticmethod
     def _apply_small_rotation_wxyz(quat_wxyz: np.ndarray, rotvec: np.ndarray) -> np.ndarray:
