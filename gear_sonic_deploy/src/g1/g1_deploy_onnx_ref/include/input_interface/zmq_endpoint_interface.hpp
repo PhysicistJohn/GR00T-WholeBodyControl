@@ -89,7 +89,7 @@
 class ZMQEndpointInterface : public InputInterface {
 public:
     /// Compile-time toggle for debug log output.
-    static constexpr bool DEBUG_LOGGING = true;
+    static constexpr bool DEBUG_LOGGING = false;
     
     // ------------------------------------------------------------------
     // Per-frame action flags (reset at the start of every update() call)
@@ -441,7 +441,9 @@ public:
                     
                         
                         new_motion = result.motion;
-                        std::cout << "[ZMQEndpointInterface] motion name: " << new_motion->name << std::endl;
+                        if constexpr (DEBUG_LOGGING) {
+                            std::cout << "[ZMQEndpointInterface] motion name: " << new_motion->name << std::endl;
+                        }
                         stream_window_start_ = result.window_start;
                         frame_offset_adjustment = result.frame_offset_adjustment;
                         did_catchup = result.did_catchup_reset;
@@ -755,8 +757,10 @@ private:
                                + " (chunk_size: " + std::to_string(num_frames) + ")";
                 }
             }
-            std::cout << "[ZMQEndpointInterface] Protocol v4: Received " << token_dim 
-                      << "D token (latent action), tokens[0]=" << token_data[0] << frame_info << std::endl;
+            if constexpr (DEBUG_LOGGING) {
+                std::cout << "[ZMQEndpointInterface] Protocol v4: Received " << token_dim
+                          << "D token (latent action), tokens[0]=" << token_data[0] << frame_info << std::endl;
+            }
             
             // Store tokens in the external token state buffer (inherited from InputInterface)
             result.token_data = std::move(token_data);
@@ -1532,14 +1536,16 @@ private:
             }
             
             // Print frame indices for protocol v3 (SMPL actions)
-            if (protocol_version == 3 && !frame_indices.empty()) {
-                if (frame_indices.size() == 1) {
-                    std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (single) - frame_index: " 
-                              << frame_indices[0] << std::endl;
-                } else {
-                    std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (chunk) - frames: " 
-                              << frame_indices[0] << " to " << frame_indices.back() 
-                              << ", chunk_size: " << frame_indices.size() << std::endl;
+            if constexpr (DEBUG_LOGGING) {
+                if (protocol_version == 3 && !frame_indices.empty()) {
+                    if (frame_indices.size() == 1) {
+                        std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (single) - frame_index: "
+                                  << frame_indices[0] << std::endl;
+                    } else {
+                        std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (chunk) - frames: "
+                                  << frame_indices[0] << " to " << frame_indices.back()
+                                  << ", chunk_size: " << frame_indices.size() << std::endl;
+                    }
                 }
             }
         }
@@ -1876,10 +1882,12 @@ private:
         std::lock_guard<std::mutex> lock(data_mutex_);
         
         // Print message received info
-        std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic 
-                  << "', protocol_version: " << hdr.version 
-                  << ", num_fields: " << hdr.fields.size() 
-                  << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        if constexpr (DEBUG_LOGGING) {
+            std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic
+                      << "', protocol_version: " << hdr.version
+                      << ", num_fields: " << hdr.fields.size()
+                      << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        }
         
         // Buffer the received data for processing in handle_input (main thread)
         buffered_header_ = hdr;
