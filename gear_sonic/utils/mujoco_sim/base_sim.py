@@ -248,7 +248,20 @@ def _scene_mesh_path(repo: Path, kind: str, model_name: str) -> Path | None:
     return None
 
 
-def _prepare_handsim_mjcf_collision(elem: ET.Element, prefix: str) -> None:
+def _strip_joints(elem: ET.Element) -> None:
+    """Drop <joint>/<freejoint> elements from an injected collision fragment.
+    These decorative DOFs (e.g. bench_full's unplug-the-cable sliders) are
+    never actuated here, but their mere presence shifts every later joint's
+    qpos address in the physics model -- if one lands ahead of the robot's
+    own free joint, index-0-based free-base assumptions elsewhere can break."""
+    for child in list(elem):
+        if child.tag in ("joint", "freejoint"):
+            elem.remove(child)
+        else:
+            _strip_joints(child)
+
+
+def _prepare_handsim_mjcf_collision(elem: ET.Element, prefix: str, mesh_map: dict[str, str] | None = None) -> None:
     name = elem.get("name")
     if name:
         elem.set("name", f"{prefix}_{name}")
@@ -258,11 +271,16 @@ def _prepare_handsim_mjcf_collision(elem: ET.Element, prefix: str) -> None:
         elem.set("conaffinity", "1")
         elem.set("friction", "1.0 0.01 0.001")
         elem.set("rgba", "0.85 0.22 0.16 0.16")
+        mesh_ref = elem.get("mesh")
+        if mesh_ref and mesh_map and mesh_ref in mesh_map:
+            elem.set("mesh", mesh_map[mesh_ref])
     for child in list(elem):
-        _prepare_handsim_mjcf_collision(child, prefix)
+        _prepare_handsim_mjcf_collision(child, prefix, mesh_map)
 
 
-def _handsim_mjcf_collision_body(repo: Path, raw_name: str, cfg: dict, x: float, y: float, yaw: float) -> str | None:
+def _handsim_mjcf_collision_body(
+    repo: Path, raw_name: str, cfg: dict, x: float, y: float, yaw: float
+) -> tuple[list[str], str] | None:
     if cfg.get("kind") != "benchtop_setup":
         return None
     source = repo / "assets" / "render" / "benchtop" / "keysight_bench_setup.xml"
@@ -276,6 +294,31 @@ def _handsim_mjcf_collision_body(repo: Path, raw_name: str, cfg: dict, x: float,
         return None
 
     prefix = "handsim_col_" + _safe_xml_name(str(raw_name))
+    # The source MJCF's own geoms can reference real <mesh> assets (e.g. the
+    # RF amplifier CAD in keysight_bench_full) -- those definitions live in
+    # <asset>, not <worldbody>, so cloning worldbody alone drops them and
+    # MuJoCo fails to compile with "mesh '...' not found". Carry them along,
+    # renamed to this instance's prefix and pointed at absolute file paths
+    # (this collision scene is written to a different directory than the
+    # source, so the source's own relative meshdir won't resolve).
+    mesh_assets = []
+    mesh_map: dict[str, str] = {}
+    asset_elem = root.find("asset")
+    if asset_elem is not None:
+        for mesh_elem in asset_elem.findall("mesh"):
+            old_name = mesh_elem.get("name")
+            file_attr = mesh_elem.get("file")
+            if not old_name or not file_attr:
+                continue
+            new_name = f"{prefix}_{old_name}"
+            mesh_map[old_name] = new_name
+            mesh_scale = mesh_elem.get("scale", "1 1 1")
+            mesh_assets.append(
+                f'    <mesh name="{new_name}" '
+                f'file="{_xml_attr(source.parent / "uploads" / file_attr)}" '
+                f'scale="{mesh_scale}"/>\n'
+            )
+
     children = []
     for child in list(worldbody):
         if child.tag == "light":
@@ -283,17 +326,19 @@ def _handsim_mjcf_collision_body(repo: Path, raw_name: str, cfg: dict, x: float,
         if child.tag == "geom" and child.get("type") == "plane":
             continue
         cloned = ET.fromstring(ET.tostring(child, encoding="unicode"))
-        _prepare_handsim_mjcf_collision(cloned, prefix)
+        _strip_joints(cloned)
+        _prepare_handsim_mjcf_collision(cloned, prefix, mesh_map)
         children.append(ET.tostring(cloned, encoding="unicode"))
     if not children:
         return None
     z = float(cfg.get("z", 0.0))
     body = "\n      ".join(children)
     return (
+        mesh_assets,
         f'    <body name="{prefix}" pos="{_xml_num(x)} {_xml_num(y)} {_xml_num(z)}" '
         f'euler="0 0 {_xml_num(yaw)}">\n'
         f"      {body}\n"
-        "    </body>\n"
+        "    </body>\n",
     )
 
 
@@ -319,8 +364,10 @@ def _handsim_collision_assets_and_geoms(scene: dict, repo: Path, anchor_xy: tupl
         key = "handsim_col_" + _safe_xml_name(str(raw_name))
 
         if kind == "benchtop_setup":
-            body = _handsim_mjcf_collision_body(repo, str(raw_name), cfg, x, y, yaw)
-            if body:
+            result = _handsim_mjcf_collision_body(repo, str(raw_name), cfg, x, y, yaw)
+            if result:
+                bench_assets, body = result
+                assets.extend(bench_assets)
                 geoms.append(body)
         elif kind == "wall":
             size = cfg.get("size", [1.0, 0.06])
@@ -792,7 +839,18 @@ class DefaultEnv:
         if self.use_floating_root_link:
             obs["floating_base_pose"] = self.mj_data.qpos[:7]
             obs["floating_base_vel"] = self.mj_data.qvel[:6]
-            obs["floating_base_acc"] = self.mj_data.qacc[:6]
+            # IMU contract (matches the real G1 lowstate): accelerometer is
+            # SPECIFIC FORCE in the body frame -- reads +g up at rest --
+            # not world-frame coordinate acceleration (qacc, zero at rest).
+            # Consumers: deploy state logger, and lidar-inertial odometry via
+            # the ros-bridge (docs/real_u8_autonomy_contract.md), whose
+            # gravity model breaks under qacc semantics.
+            acc = np.asarray(self.mj_data.qacc[:6], dtype=np.float64).copy()
+            rot9 = np.zeros(9)
+            mujoco.mju_quat2Mat(rot9, self.mj_data.qpos[3:7])
+            acc[:3] = rot9.reshape(3, 3).T @ (
+                self.mj_data.qacc[:3] - self.mj_model.opt.gravity)
+            obs["floating_base_acc"] = acc
         else:
             obs["floating_base_pose"] = np.zeros(7)
             obs["floating_base_vel"] = np.zeros(6)
