@@ -39,6 +39,16 @@ try:
 except ImportError:
     handsim_bus = None
 
+try:
+    # Optional, same PYTHONPATH story as handsim_bus above: lets a world's
+    # scene.json point "mjcf_room" at a standalone, fully-authored MJCF room
+    # (e.g. keysight_lab_mujoco/keysight_lab.xml) instead of describing it as
+    # primitive-box landmarks. Absent in standalone invocations -- mjcf_room
+    # scenes just fall back to their (still-supported) landmark boxes.
+    import handsim_world
+except ImportError:
+    handsim_world = None
+
 GEAR_SONIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 
@@ -58,11 +68,19 @@ def _xml_attr(value: Path | str) -> str:
     return str(value).replace("&", "&amp;").replace('"', "&quot;")
 
 
+def _default_handsim_world_config_path() -> Path:
+    world = os.environ.get("HANDSIM_WORLD", "keysight_lab").strip() or "keysight_lab"
+    repo = (os.environ.get("HANDSIM_REPO", "").strip()
+            or os.environ.get("DROID_REPO", "").strip()
+            or str(Path.home() / "Github" / "unitree-g1-handsim"))
+    return Path(repo).expanduser() / "assets" / "render" / "worlds" / world / "scene.json"
+
+
 def _load_handsim_collision_scene_config() -> tuple[Path, dict] | None:
     config_path = os.environ.get("HANDSIM_COLLISION_SCENE_CONFIG", "").strip()
-    if not config_path:
+    path = Path(config_path).expanduser() if config_path else _default_handsim_world_config_path()
+    if not path.exists():
         return None
-    path = Path(config_path).expanduser()
     try:
         with open(path) as f:
             scene = json.load(f)
@@ -76,12 +94,13 @@ def _load_handsim_collision_scene_config() -> tuple[Path, dict] | None:
 
 
 def _handsim_repo_root(config_path: Path) -> Path:
-    repo = os.environ.get("HANDSIM_REPO", "").strip()
+    repo = os.environ.get("HANDSIM_REPO", "").strip() or os.environ.get("DROID_REPO", "").strip()
     if repo:
         return Path(repo).expanduser()
-    # assets/render/worlds/outdoor_park/scene.json -> repo root
+    # repo/assets/render/worlds/outdoor_park/scene.json -> repo (5 segments
+    # up from the file: outdoor_park, worlds, render, assets, then repo itself)
     try:
-        return config_path.parents[3]
+        return config_path.parents[4]
     except IndexError:
         return Path.home() / "Github" / "unitree-g1-handsim"
 
@@ -342,10 +361,39 @@ def _handsim_mjcf_collision_body(
     )
 
 
+def _handsim_mjcf_room_body(scene: dict, repo: Path, anchor_xy: tuple[float, float]) -> tuple[list[str], str] | None:
+    if handsim_world is None:
+        return None
+    room_path = handsim_world.room_path(scene, repo)
+    if room_path is None:
+        return None
+    asset_xml, body_xml = handsim_world.room_fragment(room_path, "handsim_room", strip_joints=True)
+    if not body_xml:
+        return None
+    room_offset = scene.get("mjcf_room_offset", [0.0, 0.0])
+    ox = float(room_offset[0]) if isinstance(room_offset, list | tuple) and len(room_offset) > 0 else 0.0
+    oy = float(room_offset[1]) if isinstance(room_offset, list | tuple) and len(room_offset) > 1 else 0.0
+    yaw = float(scene.get("mjcf_room_yaw", 0.0))
+    x, y = anchor_xy[0] + ox, anchor_xy[1] + oy
+    assets = [asset_xml] if asset_xml else []
+    body = (
+        f'    <body name="handsim_room" pos="{_xml_num(x)} {_xml_num(y)} 0" euler="0 0 {_xml_num(yaw)}">\n'
+        f"      {body_xml}\n"
+        "    </body>\n"
+    )
+    return assets, body
+
+
 def _handsim_collision_assets_and_geoms(scene: dict, repo: Path, anchor_xy: tuple[float, float]) -> tuple[list[str], list[str]]:
     assets = []
     geoms = []
     ax, ay = anchor_xy
+
+    room = _handsim_mjcf_room_body(scene, repo, anchor_xy)
+    if room is not None:
+        room_assets, room_body = room
+        assets.extend(room_assets)
+        geoms.append(room_body)
 
     for raw_name, cfg in _iter_handsim_scene_items(scene):
         if not isinstance(cfg, dict):
