@@ -68,6 +68,15 @@ def _xml_attr(value: Path | str) -> str:
     return str(value).replace("&", "&amp;").replace('"', "&quot;")
 
 
+def _is_robot_hand_contact(body_name: str, geom_name: str) -> bool:
+    """Recognize hand links without matching the `handsim_*` namespace."""
+    label = f"{body_name} {geom_name}".lower()
+    return bool(
+        re.search(r"(^|[_\s])hand($|[_\s])", label)
+        or any(token in label for token in ("finger", "thumb", "wrist"))
+    )
+
+
 def _default_handsim_world_config_path() -> Path:
     world = os.environ.get("HANDSIM_WORLD", "keysight_lab").strip() or "keysight_lab"
     repo = (os.environ.get("HANDSIM_REPO", "").strip()
@@ -583,6 +592,13 @@ def _inject_handsim_collision_scene(xml_path: Path) -> Path:
 
     with open(xml_path) as f:
         xml = f.read()
+    if scene.get("mjcf_room"):
+        # The authored room supplies its own bounded floor. Keeping the base
+        # robot scene's infinite floor duplicates support contacts and lets
+        # range sensors observe fictitious ground beyond the room envelope.
+        xml = re.sub(
+            r'<geom\s+name="floor"[^>]*/>\s*', "", xml,
+            count=1, flags=re.S)
     if assets:
         asset_block = "\n" + "".join(assets)
         if "</asset>" in xml:
@@ -981,8 +997,7 @@ class DefaultEnv:
             contacts = contacts_by_object[object_id]
             hand_contacts = [
                 c for c in contacts
-                if any(token in f"{c['other_body']} {c['other_geom']}".lower()
-                       for token in ("hand", "finger", "thumb", "wrist"))
+                if _is_robot_hand_contact(c["other_body"], c["other_geom"])
             ]
             support_name = item["support_geom"]
             payload["objects"][object_id] = {
