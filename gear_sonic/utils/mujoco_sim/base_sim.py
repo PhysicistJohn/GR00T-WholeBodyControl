@@ -494,6 +494,78 @@ def _handsim_collision_assets_and_geoms(scene: dict, repo: Path, anchor_xy: tupl
     return assets, geoms
 
 
+def _handsim_dynamic_object_bodies(scene: dict, anchor_xy: tuple[float, float]) -> list[str]:
+    """Build separately owned free bodies after the robot joint hierarchy.
+
+    Room fragments intentionally have their decorative joints stripped.  A
+    manipulation object is different: physics must own its free joint, but it
+    must be appended after every robot/hand joint so the controller's existing
+    qpos layout remains unchanged.
+    """
+    objects = scene.get("manipulation_objects", {})
+    if not isinstance(objects, dict):
+        return []
+    out = []
+    for raw_name, cfg in objects.items():
+        if not isinstance(cfg, dict):
+            continue
+        position = cfg.get("position", [0.0, 0.0, 0.5])
+        quat = cfg.get("quat_wxyz", [1.0, 0.0, 0.0, 0.0])
+        if not isinstance(position, list | tuple) or len(position) < 3:
+            continue
+        if not isinstance(quat, list | tuple) or len(quat) < 4:
+            quat = [1.0, 0.0, 0.0, 0.0]
+        name = _safe_xml_name(str(raw_name))
+        x = anchor_xy[0] + float(position[0])
+        y = anchor_xy[1] + float(position[1])
+        z = float(position[2])
+        geoms = cfg.get("geoms", [])
+        if not isinstance(geoms, list) or not geoms:
+            continue
+        geom_xml = []
+        for index, geom in enumerate(geoms):
+            if not isinstance(geom, dict):
+                continue
+            shape = str(geom.get("shape", "sphere"))
+            if shape not in {"sphere", "cylinder", "box"}:
+                continue
+            local = geom.get("position", [0.0, 0.0, 0.0])
+            size = geom.get("size", [0.05])
+            if not isinstance(local, list | tuple) or len(local) < 3:
+                local = [0.0, 0.0, 0.0]
+            if not isinstance(size, list | tuple) or not size:
+                size = [0.05]
+            expected = 3 if shape == "box" else (2 if shape == "cylinder" else 1)
+            size_values = [max(0.002, float(v)) for v in size[:expected]]
+            if len(size_values) != expected:
+                continue
+            mass = max(0.001, float(geom.get("mass", 0.1)))
+            friction = geom.get("friction", [1.0, 0.01, 0.003])
+            if not isinstance(friction, list | tuple) or len(friction) < 3:
+                friction = [1.0, 0.01, 0.003]
+            condim = max(1, min(6, int(geom.get("condim", 4))))
+            material = _safe_xml_name(str(geom.get("material", "mat_ball")))
+            geom_name = _safe_xml_name(str(geom.get("name", index)))
+            geom_xml.append(
+                f'      <geom name="handsim_object_{name}_{geom_name}" type="{shape}" '
+                f'pos="{" ".join(_xml_num(v) for v in local[:3])}" '
+                f'material="handsim_room_{material}" '
+                f'size="{" ".join(_xml_num(v) for v in size_values)}" '
+                f'mass="{_xml_num(mass)}" '
+                f'friction="{" ".join(_xml_num(v) for v in friction[:3])}" '
+                f'condim="{condim}"/>\n'
+            )
+        if not geom_xml:
+            continue
+        out.append((
+            f'    <body name="handsim_object_{name}" '
+            f'pos="{_xml_num(x)} {_xml_num(y)} {_xml_num(z)}" '
+            f'quat="{" ".join(_xml_num(v) for v in quat[:4])}">\n'
+            f'      <freejoint name="handsim_object_{name}_free"/>\n'
+        ) + "".join(geom_xml) + '    </body>\n')
+    return out
+
+
 def _inject_handsim_collision_scene(xml_path: Path) -> Path:
     loaded = _load_handsim_collision_scene_config()
     if loaded is None:
@@ -504,7 +576,8 @@ def _inject_handsim_collision_scene(xml_path: Path) -> Path:
     anchor_xy = _initial_root_xy(xml_path)
     _write_handsim_scene_anchor(anchor_xy)
     assets, geoms = _handsim_collision_assets_and_geoms(scene, repo, anchor_xy)
-    if not geoms:
+    dynamic_objects = _handsim_dynamic_object_bodies(scene, anchor_xy)
+    if not geoms and not dynamic_objects:
         print(f"[handsim-collision] no colliders generated from {config_path}", flush=True)
         return xml_path
 
@@ -520,6 +593,7 @@ def _inject_handsim_collision_scene(xml_path: Path) -> Path:
         "\n    <body name=\"handsim_collision_scene\" pos=\"0 0 0\">\n"
         + "".join(geoms)
         + "    </body>\n"
+        + "".join(dynamic_objects)
     )
     if "</worldbody>" not in xml:
         print(f"[handsim-collision] scene has no worldbody close tag: {xml_path}", flush=True)
@@ -530,6 +604,7 @@ def _inject_handsim_collision_scene(xml_path: Path) -> Path:
         f.write(xml)
     print(
         f"[handsim-collision] injected {len(geoms)} static colliders "
+        f"and {len(dynamic_objects)} dynamic manipulation objects "
         f"({len(assets)} mesh assets) from {config_path} "
         f"at anchor ({anchor_xy[0]:.2f}, {anchor_xy[1]:.2f})",
         flush=True,
@@ -780,6 +855,152 @@ class DefaultEnv:
         self.left_hand_index = np.array(self.left_hand_index)
         self.right_hand_index = np.array(self.right_hand_index)
 
+        # Dynamic manipulation objects are appended after every robot/hand
+        # joint. Discover all addresses by name; never extend the controller's
+        # positional qpos assumptions to these free bodies.
+        self.manipulation_objects = {}
+        loaded_scene = _load_handsim_collision_scene_config()
+        object_cfgs = loaded_scene[1].get("manipulation_objects", {}) if loaded_scene else {}
+        if isinstance(object_cfgs, dict):
+            for raw_name, cfg in object_cfgs.items():
+                if not isinstance(cfg, dict):
+                    continue
+                object_id = str(raw_name)
+                safe_name = _safe_xml_name(object_id)
+                body_name = f"handsim_object_{safe_name}"
+                joint_name = f"handsim_object_{safe_name}_free"
+                body_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+                joint_id = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+                if body_id < 0 or joint_id < 0:
+                    continue
+                geom_ids = {
+                    gid for gid in range(self.mj_model.ngeom)
+                    if int(self.mj_model.geom_bodyid[gid]) == int(body_id)
+                }
+                self.manipulation_objects[object_id] = {
+                    "body_id": int(body_id),
+                    "joint_id": int(joint_id),
+                    "qpos_adr": int(self.mj_model.jnt_qposadr[joint_id]),
+                    "dof_adr": int(self.mj_model.jnt_dofadr[joint_id]),
+                    "geom_ids": geom_ids,
+                    "support_geom": str(cfg.get("support_geom", "")),
+                    "reset_qpos": self.mj_data.qpos[
+                        int(self.mj_model.jnt_qposadr[joint_id]):
+                        int(self.mj_model.jnt_qposadr[joint_id]) + 7
+                    ].copy(),
+                }
+        self._manipulation_last_command_id = None
+        self._manipulation_next_poll = 0.0
+        self._manipulation_next_publish = 0.0
+        if self.manipulation_objects:
+            print(f"[handsim-manipulation] objects={list(self.manipulation_objects)}", flush=True)
+
+    def _poll_manipulation_command(self) -> None:
+        if handsim_bus is None or not self.manipulation_objects:
+            return
+        now = time.time()
+        if now < self._manipulation_next_poll:
+            return
+        self._manipulation_next_poll = now + 0.02
+        try:
+            command = handsim_bus.read_state(handsim_bus.MANIPULATION_COMMAND)
+        except Exception:
+            return
+        if not isinstance(command, dict):
+            return
+        command_id = command.get("command_id")
+        if not command_id or command_id == self._manipulation_last_command_id:
+            return
+        self._manipulation_last_command_id = command_id
+        if command.get("action") != "reset":
+            return
+        requested_id = str(command.get("object_id", ""))
+        reset_ids = list(self.manipulation_objects) if requested_id == "*" else [requested_id]
+        reset_ids = [name for name in reset_ids if name in self.manipulation_objects]
+        if not reset_ids:
+            return
+        for object_id in reset_ids:
+            item = self.manipulation_objects[object_id]
+            pose = command.get("pose_world") if len(reset_ids) == 1 else None
+            qpos = item["reset_qpos"].copy()
+            if isinstance(pose, list | tuple) and len(pose) >= 7:
+                try:
+                    candidate = np.asarray(pose[:7], dtype=np.float64)
+                    if np.isfinite(candidate).all() and np.linalg.norm(candidate[3:7]) > 1e-6:
+                        candidate[3:7] /= np.linalg.norm(candidate[3:7])
+                        qpos = candidate
+                except (TypeError, ValueError):
+                    pass
+            qadr, dadr = item["qpos_adr"], item["dof_adr"]
+            self.mj_data.qpos[qadr:qadr + 7] = qpos
+            self.mj_data.qvel[dadr:dadr + 6] = 0.0
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+        print(f"[handsim-manipulation] reset {reset_ids} command={command_id}", flush=True)
+
+    def _publish_manipulation_state(self) -> None:
+        if handsim_bus is None or not self.manipulation_objects:
+            return
+        now = time.time()
+        if now < self._manipulation_next_publish:
+            return
+        self._manipulation_next_publish = now + 1.0 / 30.0
+        contacts_by_object = {name: [] for name in self.manipulation_objects}
+        geom_to_object = {
+            gid: name
+            for name, item in self.manipulation_objects.items()
+            for gid in item["geom_ids"]
+        }
+        for index in range(self.mj_data.ncon):
+            contact = self.mj_data.contact[index]
+            object_id = geom_to_object.get(int(contact.geom1))
+            object_geom = int(contact.geom1)
+            other_geom = int(contact.geom2)
+            if object_id is None:
+                object_id = geom_to_object.get(int(contact.geom2))
+                object_geom = int(contact.geom2)
+                other_geom = int(contact.geom1)
+            if object_id is None:
+                continue
+            force = np.zeros(6, dtype=np.float64)
+            mujoco.mj_contactForce(self.mj_model, self.mj_data, index, force)
+            other_body_id = int(self.mj_model.geom_bodyid[other_geom])
+            contacts_by_object[object_id].append({
+                "object_geom": self.mj_model.geom(object_geom).name,
+                "other_geom": self.mj_model.geom(other_geom).name,
+                "other_body": self.mj_model.body(other_body_id).name,
+                "position_world": [float(v) for v in contact.pos],
+                "normal_force_n": float(abs(force[0])),
+            })
+        payload = {"ts": now, "objects": {}}
+        for object_id, item in self.manipulation_objects.items():
+            body_id = item["body_id"]
+            velocity = np.zeros(6, dtype=np.float64)
+            mujoco.mj_objectVelocity(
+                self.mj_model, self.mj_data, mujoco.mjtObj.mjOBJ_BODY,
+                body_id, velocity, 0)
+            contacts = contacts_by_object[object_id]
+            hand_contacts = [
+                c for c in contacts
+                if any(token in f"{c['other_body']} {c['other_geom']}".lower()
+                       for token in ("hand", "finger", "thumb", "wrist"))
+            ]
+            support_name = item["support_geom"]
+            payload["objects"][object_id] = {
+                "position_world": [float(v) for v in self.mj_data.xpos[body_id]],
+                "quat_wxyz": [float(v) for v in self.mj_data.xquat[body_id]],
+                "linear_velocity_world": [float(v) for v in velocity[3:6]],
+                "angular_velocity_world": [float(v) for v in velocity[0:3]],
+                "supported": bool(support_name and any(c["other_geom"] == support_name for c in contacts)),
+                "contacts": contacts,
+                "hand_contacts": hand_contacts,
+                "contact_count": len(contacts),
+                "hand_contact_count": len(hand_contacts),
+            }
+        try:
+            handsim_bus.publish_state(handsim_bus.MANIPULATION_OBJECTS, payload)
+        except Exception:
+            pass
+
     def init_renderers(self):
         self.renderers = {}
         for camera_name, camera_config in self.camera_configs.items():
@@ -952,6 +1173,7 @@ class DefaultEnv:
         return obs
 
     def sim_step(self):
+        self._poll_manipulation_command()
         self.obs = self.prepare_obs()
         self.unitree_bridge.PublishLowState(self.obs)
         if self.unitree_bridge.joystick:
@@ -1006,6 +1228,7 @@ class DefaultEnv:
         else:
             self.mj_data.ctrl = self.torques
         mujoco.mj_step(self.mj_model, self.mj_data)
+        self._publish_manipulation_state()
 
         self.check_fall()
 
