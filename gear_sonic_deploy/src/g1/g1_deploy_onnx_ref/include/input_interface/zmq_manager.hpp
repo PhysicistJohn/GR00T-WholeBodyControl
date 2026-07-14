@@ -1278,6 +1278,17 @@ class ZMQManager : public InputInterface {
       std::lock_guard<std::mutex> lock(planner_mutex_);
       latest_planner_message_ = msg;
       latest_planner_message_.timestamp = std::chrono::steady_clock::now();
+
+      // Manipulation overlays are independent of the locomotion planner.  In
+      // particular, IDLE intentionally keeps the locomotion planner deferred so
+      // the robot can balance-hold a neutral reference.  Gating these flags in
+      // handlePlannerInput() on planner_state.enabled meant valid stationary IK
+      // commands populated the buffers but GetHandPose()/GetUpperBody* kept
+      // returning their fallbacks.  Publish the capability state as soon as the
+      // packet is decoded; a following packet without an overlay disables it.
+      has_upper_body_control_ = msg.upper_body_position.has_value();
+      has_hand_joints_ = msg.left_hand_joints.has_value() ||
+                         msg.right_hand_joints.has_value();
     }
     
 

@@ -334,17 +334,15 @@ public:
     /**
      * @brief Get 7-DOF Dex3 hand joint positions.
      * @param is_left  true → left hand, false → right hand.
-     * @return {true, joints} if hand joint data is available; {false, defaults} otherwise.
-     *         Default left  = {0, 0,  1.75, -1.57, -1.75, -1.57, -1.75}
-     *         Default right = {0, 0, -1.75,  1.57,  1.75,  1.57,  1.75}
+     * @return {true, joints} if hand joint data is available; {false, open pose} otherwise.
+     *
+     * Missing hand data must fail open.  The previous side-specific fallback
+     * values were a nearly closed grasp, so an absent/stale optional field could
+     * make both hands close unexpectedly at startup or after a stream handoff.
      */
     virtual std::pair<bool, std::array<double, 7>> GetHandPose(bool is_left) const {
         if(!has_hand_joints_) {
-            if(is_left) {
-                return {false, {0, 0, 1.75, -1.57, -1.75, -1.57, -1.75 }};
-            } else {
-                return {false, {0, 0, -1.75,  1.57,  1.75,  1.57,  1.75 }};
-            }
+            return {false, {0, 0, 0, 0, 0, 0, 0}};
         }
         if(is_left) {
             auto buffered_data = left_hand_joint_.GetDataWithTime();
@@ -352,14 +350,14 @@ public:
                 return {true, *buffered_data.data};
             }
             else {
-                return {false, {0, 0, 1.75, -1.57, -1.75, -1.57, -1.75 }};
+                return {false, {0, 0, 0, 0, 0, 0, 0}};
             }
         } else {
             auto buffered_data = right_hand_joint_.GetDataWithTime();
             if (buffered_data.data) {
                 return {true, *buffered_data.data};
             } else {
-                return {false, {0, 0, -1.75,  1.57,  1.75,  1.57,  1.75 }};
+                return {false, {0, 0, 0, 0, 0, 0, 0}};
             }
         }
     }
