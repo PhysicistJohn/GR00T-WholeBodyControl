@@ -849,6 +849,8 @@ class DefaultEnv:
         self.body_joint_index = []
         self.left_hand_index = []
         self.right_hand_index = []
+        configured_left_hand = self.config.get("LEFT_HAND_JOINT_NAMES")
+        configured_right_hand = self.config.get("RIGHT_HAND_JOINT_NAMES")
         for i in range(self.mj_model.njnt):
             name = self.mj_model.joint(i).name
             if any(
@@ -858,10 +860,21 @@ class DefaultEnv:
                 ]
             ):
                 self.body_joint_index.append(i)
-            elif "left_hand" in name:
+            elif configured_left_hand is None and "left_hand" in name:
                 self.left_hand_index.append(i)
-            elif "right_hand" in name:
+            elif configured_right_hand is None and "right_hand" in name:
                 self.right_hand_index.append(i)
+
+        if configured_left_hand is not None:
+            self.left_hand_index = [
+                mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                for name in configured_left_hand
+            ]
+        if configured_right_hand is not None:
+            self.right_hand_index = [
+                mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, name)
+                for name in configured_right_hand
+            ]
 
         assert len(self.body_joint_index) == self.robot.NUM_JOINTS
         assert len(self.left_hand_index) == self.robot.NUM_HAND_JOINTS
@@ -870,6 +883,30 @@ class DefaultEnv:
         self.body_joint_index = np.array(self.body_joint_index)
         self.left_hand_index = np.array(self.left_hand_index)
         self.right_hand_index = np.array(self.right_hand_index)
+
+        def actuator_ids(joint_ids):
+            result = []
+            transmission_joints = np.asarray(self.mj_model.actuator_trnid)[:, 0]
+            for joint_id in joint_ids:
+                matches = np.flatnonzero(transmission_joints == int(joint_id))
+                if len(matches) != 1:
+                    joint_name = self.mj_model.joint(int(joint_id)).name
+                    raise ValueError(
+                        f"joint {joint_name!r} has {len(matches)} actuators; expected exactly one"
+                    )
+                result.append(int(matches[0]))
+            return np.asarray(result, dtype=np.int64)
+
+        self.body_actuator_index = actuator_ids(self.body_joint_index)
+        self.left_hand_actuator_index = actuator_ids(self.left_hand_index)
+        self.right_hand_actuator_index = actuator_ids(self.right_hand_index)
+        self.torques = np.zeros(self.mj_model.nu, dtype=np.float64)
+        if np.all(self.mj_model.actuator_ctrllimited):
+            self.torque_limit = np.max(np.abs(self.mj_model.actuator_ctrlrange), axis=1)
+        elif len(self.torque_limit) != self.mj_model.nu:
+            raise ValueError(
+                f"torque-limit vector has {len(self.torque_limit)} entries for {self.mj_model.nu} actuators"
+            )
 
         # Dynamic manipulation objects are appended after every robot/hand
         # joint. Discover all addresses by name; never extend the controller's
@@ -1157,12 +1194,12 @@ class DefaultEnv:
         obs["body_q"] = self.mj_data.qpos[self.body_joint_index + 7 - 1]
         obs["body_dq"] = self.mj_data.qvel[self.body_joint_index + 6 - 1]
         obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
-        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
+        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_actuator_index]
         if self.num_hand_dof > 0:
             obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_index + self.qpos_offset - 1]
             obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_index + self.qvel_offset - 1]
             obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_index - 1]
+            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_actuator_index]
             obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
             obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + self.qvel_offset - 1]
             obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
@@ -1183,7 +1220,7 @@ class DefaultEnv:
                     obs[side] = obs[side] + rng.normal(0.0, self._joint_pos_noise_std, size=obs[side].shape)
                 for side in ("left_hand_dq", "right_hand_dq"):
                     obs[side] = obs[side] + rng.normal(0.0, self._joint_vel_noise_std, size=obs[side].shape)
-            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
+            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_actuator_index]
         obs["time"] = self.mj_data.time
         return obs
 
@@ -1229,11 +1266,11 @@ class DefaultEnv:
                 self.mj_data.xfrc_applied[self.band_attached_link] = np.zeros(6)
         body_torques = self.compute_body_torques()
         hand_torques = self.compute_hand_torques()
-        # -1: actuator array is 0-based while joint indices from the model are 1-based
-        self.torques[self.body_joint_index - 1] = body_torques
+        self.torques.fill(0.0)
+        self.torques[self.body_actuator_index] = body_torques
         if self.num_hand_dof > 0:
-            self.torques[self.left_hand_index - 1] = hand_torques[: self.num_hand_dof]
-            self.torques[self.right_hand_index - 1] = hand_torques[self.num_hand_dof :]
+            self.torques[self.left_hand_actuator_index] = hand_torques[: self.num_hand_dof]
+            self.torques[self.right_hand_actuator_index] = hand_torques[self.num_hand_dof :]
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
 

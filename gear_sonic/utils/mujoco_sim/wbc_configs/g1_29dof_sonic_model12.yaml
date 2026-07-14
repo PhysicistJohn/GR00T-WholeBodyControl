@@ -1,6 +1,6 @@
 # copy from g1_43dof_hist.yaml
 ROBOT_TYPE: 'g1_29dof' # Robot name, "go2", "b2", "b2w", "h1", "go2w", "g1" 
-ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml" # Robot scene, for Sim2Sim
+ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_41dof_revo2.xml" # G1 U8 + BrainCo Revo2
 # ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_29dof_activated3dex.xml"
 
 DOMAIN_ID: 0 # Domain id
@@ -183,8 +183,24 @@ WeakMotorJointIndex:
 
 NUM_MOTORS: 29
 NUM_JOINTS: 29
-NUM_HAND_MOTORS: 7
-NUM_HAND_JOINTS: 7
+NUM_HAND_MOTORS: 6
+NUM_HAND_JOINTS: 6
+LEFT_HAND_JOINT_NAMES: [
+  left_hand_thumb_metacarpal_joint,
+  left_hand_thumb_proximal_joint,
+  left_hand_index_proximal_joint,
+  left_hand_middle_proximal_joint,
+  left_hand_ring_proximal_joint,
+  left_hand_pinky_proximal_joint,
+]
+RIGHT_HAND_JOINT_NAMES: [
+  right_hand_thumb_metacarpal_joint,
+  right_hand_thumb_proximal_joint,
+  right_hand_index_proximal_joint,
+  right_hand_middle_proximal_joint,
+  right_hand_ring_proximal_joint,
+  right_hand_pinky_proximal_joint,
+]
 NUM_UPPER_BODY_JOINTS: 17
 
 DEFAULT_DOF_ANGLES: [
