@@ -7,6 +7,7 @@ so the WBC policy sees the sim as a real robot.
 
 import sys
 import threading
+import time
 from typing import Dict, Tuple
 
 import numpy as np
@@ -133,6 +134,7 @@ class UnitreeSdk2Bridge:
         with self.low_cmd_lock:
             self.low_cmd_received = False
             self.new_low_cmd = False
+            self.last_low_cmd_monotonic = None
         with self.left_hand_cmd_lock:
             self.left_hand_cmd_received = False
             self.new_left_hand_cmd = False
@@ -145,6 +147,28 @@ class UnitreeSdk2Bridge:
             self.low_cmd = msg
             self.low_cmd_received = True
             self.new_low_cmd = True
+            self.last_low_cmd_monotonic = time.monotonic()
+
+    def body_command_snapshot(self):
+        """Return a coherent body command and local receive age.
+
+        The receive timestamp is local monotonic time, so simulator startup
+        never depends on DDS sender clocks.  ``None`` means no real LowCmd has
+        arrived; the default-constructed IDL message is not command authority.
+        """
+        with self.low_cmd_lock:
+            if not self.low_cmd_received or self.last_low_cmd_monotonic is None:
+                return None
+            command = self.low_cmd
+            count = self.num_body_motor
+            return {
+                "age_s": time.monotonic() - self.last_low_cmd_monotonic,
+                "q": np.asarray([command.motor_cmd[i].q for i in range(count)], dtype=float),
+                "dq": np.asarray([command.motor_cmd[i].dq for i in range(count)], dtype=float),
+                "kp": np.asarray([command.motor_cmd[i].kp for i in range(count)], dtype=float),
+                "kd": np.asarray([command.motor_cmd[i].kd for i in range(count)], dtype=float),
+                "tau": np.asarray([command.motor_cmd[i].tau for i in range(count)], dtype=float),
+            }
 
     def LeftHandCmdHandler(self, msg):
         with self.left_hand_cmd_lock:

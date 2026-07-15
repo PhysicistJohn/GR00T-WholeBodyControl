@@ -4170,9 +4170,15 @@ class G1Deploy {
           // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
           dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
           
-          // set hand poses (use buffered data for consistency)
-          dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
-          dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+          // set hand poses (use buffered data for consistency). Gains must be
+          // explicit: a fresh HandCmd_ defaults kp/kd to zero, and the MuJoCo
+          // bridge computes finger torque as tau + kp*(q-qpos) + kd*(dq-qvel),
+          // so ungained commands leave the simulated fingers limp forever
+          // (real Dex3 firmware acts on q regardless, which hid this).
+          static constexpr std::array<double, 7> kHandKp{1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5};
+          static constexpr std::array<double, 7> kHandKd{0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1};
+          dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_, std::nullopt, kHandKp, kHandKd);
+          dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_, std::nullopt, kHandKp, kHandKd);
           
           // Update last hand actions for logging (use buffered data)
           for (int i = 0; i < 7; ++i) {

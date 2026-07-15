@@ -49,6 +49,23 @@ try:
 except ImportError:
     handsim_world = None
 
+_bootstrap_import_error = None
+try:
+    from g1_mcp.bootstrap import (
+        BootstrapPhase,
+        JointBootstrapCommand,
+        SimBootstrapConfig,
+        SimBootstrapController,
+    )
+    from robot_registry import DEFAULT_29
+except ImportError as exc:
+    _bootstrap_import_error = exc
+    BootstrapPhase = None
+    JointBootstrapCommand = None
+    SimBootstrapConfig = None
+    SimBootstrapController = None
+    DEFAULT_29 = None
+
 GEAR_SONIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
 
@@ -681,6 +698,33 @@ class DefaultEnv:
         self.onscreen = onscreen
 
         self.init_scene()
+        self.bootstrap_controller = None
+        self._bootstrap_phase = None
+        if self.config.get("ENABLE_BOOTSTRAP_CONTROLLER", False):
+            if SimBootstrapController is None or DEFAULT_29 is None:
+                raise RuntimeError(
+                    "ENABLE_BOOTSTRAP_CONTROLLER requires unitree-g1-handsim/src "
+                    f"and scripts on PYTHONPATH; import failed: {_bootstrap_import_error!r}"
+                ) from _bootstrap_import_error
+            if len(DEFAULT_29) != self.num_body_dof:
+                raise RuntimeError(
+                    f"bootstrap stand pose has {len(DEFAULT_29)} joints; "
+                    f"simulator expects {self.num_body_dof}"
+                )
+            bootstrap_config = SimBootstrapConfig(
+                damping_seconds=float(os.environ.get("DROID_BOOT_DAMPING_SECONDS", "0.5")),
+                stand_seconds=float(os.environ.get("DROID_BOOT_STAND_SECONDS", "2.5")),
+                external_stable_seconds=float(
+                    os.environ.get("DROID_BOOT_EXTERNAL_STABLE_SECONDS", "0.1")
+                ),
+                handover_seconds=float(os.environ.get("DROID_BOOT_HANDOVER_SECONDS", "1.0")),
+                hold_kp=float(os.environ.get("DROID_BOOT_HOLD_KP", "24.0")),
+                hold_kd=float(os.environ.get("DROID_BOOT_HOLD_KD", "3.0")),
+                damping_kd=float(os.environ.get("DROID_BOOT_DAMPING_KD", "4.0")),
+            )
+            self.bootstrap_controller = SimBootstrapController(
+                np.asarray(DEFAULT_29, dtype=float), bootstrap_config
+            )
         self.last_reward = 0
 
         self.offscreen = offscreen
@@ -1063,6 +1107,45 @@ class DefaultEnv:
 
     def compute_body_torques(self) -> np.ndarray:
         # PD control: tau = tau_ff + kp * (q_des - q) + kd * (dq_des - dq)
+        q = self.mj_data.qpos[self.body_joint_index + self.qpos_offset - 1]
+        dq = self.mj_data.qvel[self.body_joint_index + self.qvel_offset - 1]
+        if self.bootstrap_controller is not None:
+            snapshot = self.unitree_bridge.body_command_snapshot()
+            external = None
+            max_age = float(os.environ.get("DROID_BOOT_EXTERNAL_MAX_AGE_SECONDS", "0.1"))
+            min_kp = float(os.environ.get("DROID_BOOT_EXTERNAL_MIN_KP", "1.0"))
+            min_active = int(os.environ.get("DROID_BOOT_EXTERNAL_MIN_ACTIVE_JOINTS", "12"))
+            command_is_active = (
+                snapshot is not None
+                and int(np.count_nonzero(snapshot["kp"] >= min_kp)) >= min_active
+            )
+            if snapshot is not None and snapshot["age_s"] <= max_age and command_is_active:
+                external = JointBootstrapCommand(
+                    q=snapshot["q"],
+                    dq=snapshot["dq"],
+                    kp=snapshot["kp"],
+                    kd=snapshot["kd"],
+                    tau=snapshot["tau"],
+                )
+            handover_allowed = os.path.exists(
+                os.environ.get("DROID_BOOT_HANDOVER_PATH", "/tmp/bootstrap_handover")
+            )
+            command = self.bootstrap_controller.step(
+                self.mj_data.time,
+                q,
+                dq,
+                external,
+                handover_allowed=handover_allowed,
+            )
+            if self.bootstrap_controller.phase != self._bootstrap_phase:
+                self._bootstrap_phase = self.bootstrap_controller.phase
+                print(f"[base_sim] bootstrap -> {self._bootstrap_phase.value}", flush=True)
+            if self.bootstrap_controller.phase is BootstrapPhase.READY:
+                # Permanently relinquish startup authority. Runtime LowCmd
+                # freshness and safety now belong to SONIC's normal path.
+                self.bootstrap_controller = None
+            return command.tau + command.kp * (command.q - q) + command.kd * (command.dq - dq)
+
         body_torques = np.zeros(self.num_body_dof)
         if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
             for i in range(self.unitree_bridge.num_body_motor):

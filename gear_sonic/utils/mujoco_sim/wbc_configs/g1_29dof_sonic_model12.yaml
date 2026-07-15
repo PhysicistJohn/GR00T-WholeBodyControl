@@ -18,6 +18,7 @@ FREE_BASE: False
 
 PRINT_SCENE_INFORMATION: True # Print link, joint and sensors information of robot
 ENABLE_ELASTIC_BAND: True # [MULTI-48] band holds robot at standing height through the CONTROL handoff; released headlessly via /tmp/release_band once the policy settles
+ENABLE_BOOTSTRAP_CONTROLLER: True # local tick-one damping/stand hold; blends to the first fresh SONIC LowCmd
 
 # 500Hz to match the real robot's control-loop cadence (2.5x finer than the
 # prior 200Hz). Measured headroom before landing this: raw mj_step ~147us
