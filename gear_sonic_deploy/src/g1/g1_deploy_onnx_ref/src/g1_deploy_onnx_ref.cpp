@@ -3294,6 +3294,33 @@ class G1Deploy {
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
       }
+      if (has_upper_body_data_) {
+        // The policy still owns legs and waist so balance remains closed-loop.
+        // Arm manipulation references, however, need deterministic impedance
+        // tracking rather than being merely an observation that the locomotion
+        // policy may approximate.  The ZMQ buffer is in IsaacLab upper-body
+        // order; map its 14 arm entries (skip waist[0:3]) to MuJoCo/LowCmd
+        // motor indices and overwrite only q/dq. Existing per-motor gains,
+        // limits, sanitizer, and 500 Hz writer remain authoritative.
+        // The policy gains are a soft locomotion impedance (~14 N·m/rad on the
+        // 5020 arm motors); an outstretched arm sags ~0.13 rad under gravity
+        // at that stiffness, which fails the pick executor's 0.08 rad
+        // convergence guard. Manipulation tracking needs its own impedance:
+        // 4x kp (~57 N·m/rad, far below the 25 N·m effort limit at any sane
+        // error) with 2x kd to keep the damping ratio.
+        constexpr float kOverlayArmKpScale = 4.0f;
+        constexpr float kOverlayArmKdScale = 2.0f;
+        for (size_t i = 3; i < 17; i++) {
+          const int motor_index = upper_body_joint_isaaclab_order_in_mujoco_index[i];
+          motor_command_tmp.q_target.at(motor_index) =
+              static_cast<float>(upper_body_joint_positions_buffer_[i]);
+          motor_command_tmp.dq_target.at(motor_index) =
+              static_cast<float>(upper_body_joint_velocities_buffer_[i]);
+          motor_command_tmp.tau_ff.at(motor_index) = 0.0f;
+          motor_command_tmp.kp.at(motor_index) = kps[motor_index] * kOverlayArmKpScale;
+          motor_command_tmp.kd.at(motor_index) = kds[motor_index] * kOverlayArmKdScale;
+        }
+      }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
     }
