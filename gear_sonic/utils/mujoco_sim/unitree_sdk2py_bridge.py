@@ -79,6 +79,12 @@ class UnitreeSdk2Bridge:
         self.torso_imu_state = IMUState_default()
         self.torso_imu_puber = ChannelPublisher("rt/secondary_imu", IMUState_)
         self.torso_imu_puber.Init()
+        self.mid360_imu_enable = bool(config.get("MID360_IMU_ENABLE", False))
+        self.mid360_imu_state = IMUState_default()
+        self.mid360_imu_puber = None
+        if self.mid360_imu_enable:
+            self.mid360_imu_puber = ChannelPublisher("rt/mid360_imu", IMUState_)
+            self.mid360_imu_puber.Init()
 
         self.left_hand_state = HandState_default()
         self.left_hand_state_puber = ChannelPublisher("rt/dex3/left/state", HandState_)
@@ -241,6 +247,20 @@ class UnitreeSdk2Bridge:
             self.right_hand_state.motor_state[i].q = obs["right_hand_q"][i]
             self.right_hand_state.motor_state[i].dq = obs["right_hand_dq"][i]
         self.right_hand_state_puber.Write(self.right_hand_state)
+
+    def PublishMid360Imu(self, obs: Dict[str, any]):
+        """Publish the raw, physically upside-down Mid-360 site IMU at 200 Hz.
+
+        Acceleration intentionally uses the Livox wire/driver convention of
+        ``g`` rather than SI m/s^2.  The sim-side Livox adapter performs the
+        same 180-degree correction as the DeepGlint driver before ROS publish.
+        """
+        if not self.mid360_imu_enable or self.mid360_imu_puber is None:
+            return
+        self.mid360_imu_state.quaternion[:] = obs["mid360_imu_quat_raw"]
+        self.mid360_imu_state.gyroscope[:] = obs["mid360_imu_gyro_raw"]
+        self.mid360_imu_state.accelerometer[:] = obs["mid360_imu_accel_raw_g"]
+        self.mid360_imu_puber.Write(self.mid360_imu_state)
 
     def GetAction(self) -> Tuple[np.ndarray, bool, bool]:
         with self.low_cmd_lock:

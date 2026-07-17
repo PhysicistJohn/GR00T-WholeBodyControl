@@ -25,6 +25,11 @@ from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
 from gear_sonic.utils.mujoco_sim.metric_utils import check_contact, check_height
+from gear_sonic.utils.mujoco_sim.mid360_imu import (
+    Mid360NoiseConfig,
+    Mid360NoiseModel,
+    PhaseLockedSampler,
+)
 from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
 from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
 from gear_sonic.utils.mujoco_sim.robot import Robot
@@ -688,6 +693,30 @@ class DefaultEnv:
         self._poll_live_settings(force=True)
         self.camera_configs = camera_configs
 
+        self.mid360_imu_enable = bool(self.config.get("MID360_IMU_ENABLE", False))
+        self._mid360_sampler = PhaseLockedSampler(
+            float(self.config.get("MID360_IMU_HZ", 200.0))
+        )
+        self._mid360_noise = Mid360NoiseModel(
+            Mid360NoiseConfig(
+                frequency_hz=float(self.config.get("MID360_IMU_HZ", 200.0)),
+                gyro_noise_density_rad_s_sqrt_hz=float(
+                    self.config.get("MID360_IMU_GYRO_NOISE_DENSITY", np.deg2rad(0.02))
+                ),
+                accel_noise_density_g_sqrt_hz=float(
+                    self.config.get("MID360_IMU_ACCEL_NOISE_DENSITY", 30e-6)
+                ),
+                gyro_bias_std_rad_s=float(
+                    self.config.get("MID360_IMU_GYRO_BIAS_STD", np.deg2rad(10.0) / 3600.0)
+                ),
+                accel_bias_std_g=float(
+                    self.config.get("MID360_IMU_ACCEL_BIAS_STD", 100e-6)
+                ),
+                enabled=bool(self.config.get("MID360_IMU_NOISE_ENABLE", True)),
+                seed=self.config.get("MID360_IMU_NOISE_SEED"),
+            )
+        )
+
         if not camera_configs and offscreen and enable_image_publish:
             self.camera_configs = {
                 "ego_view": {"height": 480, "width": 640, "mjcf_name": "head_camera"},
@@ -820,6 +849,28 @@ class DefaultEnv:
         self.torso_index = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
         self.root_body = "pelvis"
         self.root_body_id = self.mj_model.body(self.root_body).id
+
+        self._mid360_sensor_slices: dict[str, slice] = {}
+        if self.mid360_imu_enable:
+            for key, name, dimension in (
+                ("quat", "mid360_imu_quat_raw", 4),
+                ("gyro", "mid360_imu_gyro_raw", 3),
+                ("accel", "mid360_imu_accel_raw", 3),
+            ):
+                sensor_id = mujoco.mj_name2id(
+                    self.mj_model, mujoco.mjtObj.mjOBJ_SENSOR, name
+                )
+                if sensor_id < 0:
+                    raise RuntimeError(
+                        f"MID360_IMU_ENABLE requires MuJoCo sensor {name!r}"
+                    )
+                address = int(self.mj_model.sensor_adr[sensor_id])
+                actual_dimension = int(self.mj_model.sensor_dim[sensor_id])
+                if actual_dimension != dimension:
+                    raise RuntimeError(
+                        f"sensor {name!r} has dimension {actual_dimension}, expected {dimension}"
+                    )
+                self._mid360_sensor_slices[key] = slice(address, address + dimension)
 
         self.joint_class_map = self._get_dof_indices_by_class()
 
@@ -1274,6 +1325,25 @@ class DefaultEnv:
         )
         obs["secondary_imu_vel"] = pose[7:13]
 
+        if self.mid360_imu_enable:
+            raw_quat = np.asarray(
+                self.mj_data.sensordata[self._mid360_sensor_slices["quat"]],
+                dtype=np.float64,
+            ).copy()
+            raw_gyro = np.asarray(
+                self.mj_data.sensordata[self._mid360_sensor_slices["gyro"]],
+                dtype=np.float64,
+            )
+            raw_accel = np.asarray(
+                self.mj_data.sensordata[self._mid360_sensor_slices["accel"]],
+                dtype=np.float64,
+            )
+            gyro, accel_g = self._mid360_noise.apply(raw_gyro, raw_accel)
+            obs["mid360_imu_quat_raw"] = raw_quat
+            obs["mid360_imu_gyro_raw"] = gyro
+            obs["mid360_imu_accel_raw_g"] = accel_g
+            obs["mid360_imu_publish"] = self._mid360_sampler.due(self.mj_data.time)
+
         obs["body_q"] = self.mj_data.qpos[self.body_joint_index + 7 - 1]
         obs["body_dq"] = self.mj_data.qvel[self.body_joint_index + 6 - 1]
         obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
@@ -1311,6 +1381,8 @@ class DefaultEnv:
         self._poll_manipulation_command()
         self.obs = self.prepare_obs()
         self.unitree_bridge.PublishLowState(self.obs)
+        if self.obs.get("mid360_imu_publish", False):
+            self.unitree_bridge.PublishMid360Imu(self.obs)
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
         if self.elastic_band:
@@ -1516,6 +1588,8 @@ class DefaultEnv:
 
     def reset(self):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
+        self._mid360_sampler.reset()
+        self._mid360_noise.reset()
         if self.sensor_noise_enable:
             self._resample_imu_bias()
 

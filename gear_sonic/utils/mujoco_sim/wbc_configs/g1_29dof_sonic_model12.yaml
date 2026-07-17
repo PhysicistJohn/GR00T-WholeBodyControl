@@ -37,6 +37,20 @@ REWARD_DT: 0.02
 # rate the prior 0.033333/0.005 (6-step, "33.33Hz"-ish) config actually ran at.
 IMAGE_DT: 0.030
 
+# Livox Mid-360 built-in IMU.  This is separate from the G1 pelvis IMU in
+# rt/lowstate: a native MuJoCo site sensor follows the articulated upper-body
+# mount and publishes raw upside-down measurements on rt/mid360_imu.  The
+# simulated Livox driver rotates lidar + IMU together before /livox/* publish.
+MID360_IMU_ENABLE: True
+MID360_IMU_HZ: 200.0
+MID360_IMU_NOISE_ENABLE: True
+# Livox Mid-360 datasheet noise density / bias-stability bounds.
+MID360_IMU_GYRO_NOISE_DENSITY: 0.00034906585  # 0.02 deg/s/sqrt(Hz), rad/s/sqrt(Hz)
+MID360_IMU_ACCEL_NOISE_DENSITY: 0.000030      # 30 ug/sqrt(Hz), g/sqrt(Hz)
+MID360_IMU_GYRO_BIAS_STD: 0.00004848137       # 10 deg/hour, rad/s
+MID360_IMU_ACCEL_BIAS_STD: 0.000100           # 100 ug, g
+# MID360_IMU_NOISE_SEED: 0
+
 # Optional sensor-noise layer (default off, bit-identical to before when
 # false). No real noise-magnitude spec exists for this robot -- these are
 # conservative placeholders, tune as needed. SENSOR_NOISE_SEED unset = random.
