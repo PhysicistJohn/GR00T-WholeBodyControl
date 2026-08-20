@@ -16,6 +16,7 @@ import tempfile
 from threading import Lock, Thread
 import time
 from typing import Dict
+import uuid
 import xml.etree.ElementTree as ET
 
 import mujoco
@@ -159,6 +160,35 @@ def _load_handsim_collision_scene_config() -> tuple[Path, dict] | None:
         print(f"[handsim-collision] scene config ignored: {path} is not an object", flush=True)
         return None
     return path, scene
+
+
+def _scene_metadata_string(value: object) -> str | None:
+    """Return a non-empty scene metadata string, or no metadata."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _scene_single_sphere_radius_m(cfg: dict) -> float | None:
+    """Read a usable radius only when a scene object has one sphere geom."""
+    geoms = cfg.get("geoms")
+    if not isinstance(geoms, list | tuple):
+        return None
+    sphere_geoms = [
+        geom for geom in geoms
+        if isinstance(geom, dict) and str(geom.get("shape", "")).lower() == "sphere"
+    ]
+    if len(sphere_geoms) != 1:
+        return None
+    size = sphere_geoms[0].get("size")
+    if not isinstance(size, list | tuple) or not size:
+        return None
+    try:
+        radius = float(size[0])
+    except (TypeError, ValueError):
+        return None
+    return radius if math.isfinite(radius) and radius > 0.0 else None
 
 
 def _handsim_repo_root(config_path: Path) -> Path:
@@ -1044,6 +1074,11 @@ class DefaultEnv:
         # joint. Discover all addresses by name; never extend the controller's
         # positional qpos assumptions to these free bodies.
         self.manipulation_objects = {}
+        # A process-unique namespace makes a respawn distinguishable even
+        # when a station starts at the same pose.  Per-object generations are
+        # incremented only by that object's reset command, so their epochs
+        # remain stable throughout ordinary physics motion.
+        self._manipulation_epoch_namespace = uuid.uuid4().hex
         loaded_scene = _load_handsim_collision_scene_config()
         object_cfgs = loaded_scene[1].get("manipulation_objects", {}) if loaded_scene else {}
         if isinstance(object_cfgs, dict):
@@ -1068,12 +1103,25 @@ class DefaultEnv:
                     "qpos_adr": int(self.mj_model.jnt_qposadr[joint_id]),
                     "dof_adr": int(self.mj_model.jnt_dofadr[joint_id]),
                     "geom_ids": geom_ids,
+                    "label": _scene_metadata_string(cfg.get("label")) or object_id,
                     "support_geom": str(cfg.get("support_geom", "")),
+                    "support_object_id": _scene_metadata_string(cfg.get("support_object_id")),
+                    "sphere_radius_m": _scene_single_sphere_radius_m(cfg),
+                    "epoch_generation": 0,
                     "reset_qpos": self.mj_data.qpos[
                         int(self.mj_model.jnt_qposadr[joint_id]):
                         int(self.mj_model.jnt_qposadr[joint_id]) + 7
                     ].copy(),
                 }
+        # A support can refer to an object defined later in the scene.  Resolve
+        # it only once every physics-backed object record is present, and do
+        # not publish dangling or self-referential support identities.
+        for object_id, item in self.manipulation_objects.items():
+            support_object_id = item["support_object_id"]
+            if support_object_id == object_id or (
+                support_object_id is not None and support_object_id not in self.manipulation_objects
+            ):
+                item["support_object_id"] = None
         self._manipulation_last_command_id = None
         self._manipulation_next_poll = 0.0
         self._manipulation_next_publish = 0.0
@@ -1111,6 +1159,7 @@ class DefaultEnv:
             return
         for object_id in reset_ids:
             item = self.manipulation_objects[object_id]
+            item["epoch_generation"] += 1
             pose = command.get("pose_world") if len(reset_ids) == 1 else None
             qpos = item["reset_qpos"].copy()
             if isinstance(pose, list | tuple) and len(pose) >= 7:
@@ -1175,6 +1224,10 @@ class DefaultEnv:
             ]
             support_name = item["support_geom"]
             payload["objects"][object_id] = {
+                "label": item["label"],
+                "support_object_id": item["support_object_id"],
+                "sphere_radius_m": item["sphere_radius_m"],
+                "object_epoch": f"{self._manipulation_epoch_namespace}:{item['epoch_generation']}",
                 "position_world": [float(v) for v in self.mj_data.xpos[body_id]],
                 "quat_wxyz": [float(v) for v in self.mj_data.xquat[body_id]],
                 "linear_velocity_world": [float(v) for v in velocity[3:6]],
