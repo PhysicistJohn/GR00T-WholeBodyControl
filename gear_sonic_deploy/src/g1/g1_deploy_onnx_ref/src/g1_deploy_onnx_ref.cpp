@@ -196,9 +196,9 @@ class G1Deploy {
   private:
     /// State machine for the control loop lifecycle.
     enum class ProgramState { INIT, WAIT_FOR_CONTROL, CONTROL };
-    using SensorPhaseGate = LowStatePhaseGate<LowState_, IMUState_>;
-    enum class SensorPhaseSkipReason { kTimeout, kExpiredBeforeConsumption };
-    enum class GatherRobotStateResult { kReady, kSensorPairExpired, kInvalidState };
+    using LowStatePhaseGateT = LowStatePhaseGate<LowState_>;
+    enum class LowStatePhaseSkipReason { kTimeout, kExpiredBeforeConsumption };
+    enum class GatherRobotStateResult { kReady, kLowStateExpired, kInvalidState };
     
     // =========================================================================
     // Core timing, mode, and counters
@@ -315,7 +315,7 @@ class G1Deploy {
     DataBuffer<IMUState_> imu_torso_buffer_;
     DataBuffer<HeadingState> heading_state_buffer_;
     DataBuffer<MovementState> movement_state_buffer_;
-    SensorPhaseGate low_state_phase_gate_;
+    LowStatePhaseGateT low_state_phase_gate_;
     
     ChannelPublisherPtr<LowCmd_> lowcmd_publisher_;
     ChannelSubscriberPtr<LowState_> lowstate_subscriber_;
@@ -345,7 +345,6 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds LOW_STATE_LATE_THRESHOLD{50};
     static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
     static constexpr std::chrono::milliseconds LOW_STATE_PHASE_MAX_AGE{1};
-    static constexpr std::chrono::milliseconds SENSOR_PAIR_MAX_RECEIPT_SKEW{2};
     static constexpr std::chrono::milliseconds LOW_STATE_PHASE_MAX_WAIT{10};
     ProgramState program_state_;
     std::array<double, G1_NUM_MOTOR> last_action;
@@ -388,7 +387,7 @@ class G1Deploy {
     double low_state_age_at_state_snapshot_ms_ = -1.0;
     std::uint64_t low_state_phase_timeout_count_ = 0;
     std::uint64_t low_state_phase_expired_before_consumption_count_ = 0;
-    std::optional<std::chrono::steady_clock::time_point> coherent_sensor_pair_loss_started_at_;
+    std::optional<std::chrono::steady_clock::time_point> low_state_phase_loss_started_at_;
 
     // State logger
     std::unique_ptr<StateLogger> state_logger_;
@@ -2727,11 +2726,11 @@ class G1Deploy {
     }
 
     /// DDS callback: receives LowState at 200 Hz in this simulation and commonly
-    /// 500 Hz from hardware.  Valid messages are paired with torso IMU receipts.
-    /// Validates CRC (unless disabled for MuJoCo sim) and stores the result
-    /// in the thread-safe low_state_buffer_.
+    /// 500 Hz from hardware. Validates CRC (unless disabled for MuJoCo sim),
+    /// stores the result in the thread-safe low_state_buffer_, and advances the
+    /// policy phase clock.
     void LowStateHandler(const void* message) {
-      const auto receipt_time = SensorPhaseGate::Clock::now();
+      const auto receipt_time = LowStatePhaseGateT::Clock::now();
       LowState_ low_state = *(const LowState_*)message;
 
       // Only perform CRC check if not disabled (for MuJoCo simulation compatibility)
@@ -2770,10 +2769,8 @@ class G1Deploy {
 
     /// DDS callback: receives secondary (torso) IMU data.
     void imuTorsoHandler(const void* message) {
-      const auto receipt_time = SensorPhaseGate::Clock::now();
       IMUState_ imu_torso = *(const IMUState_*)message;
       imu_torso_buffer_.SetData(imu_torso);
-      low_state_phase_gate_.NotifyTorsoImu(imu_torso, receipt_time);
     }
 
     /**
@@ -2969,35 +2966,35 @@ class G1Deploy {
     }
 
     /// Account for a skipped policy tick without treating one late wake as a shutdown.
-    void HandleSkippedSensorPhaseTick(
-        SensorPhaseSkipReason reason, SensorPhaseGate::Clock::time_point phase_wait_start_time) {
+    void HandleSkippedLowStatePhaseTick(
+        LowStatePhaseSkipReason reason, LowStatePhaseGateT::Clock::time_point phase_wait_start_time) {
       const std::uint64_t skipped_count =
-          reason == SensorPhaseSkipReason::kTimeout
+          reason == LowStatePhaseSkipReason::kTimeout
               ? ++low_state_phase_timeout_count_
               : ++low_state_phase_expired_before_consumption_count_;
-      const char* const reason_text = reason == SensorPhaseSkipReason::kTimeout
+      const char* const reason_text = reason == LowStatePhaseSkipReason::kTimeout
                                           ? "phase timeout"
                                           : "expired before consumption";
 
-      const auto now = SensorPhaseGate::Clock::now();
-      if (!coherent_sensor_pair_loss_started_at_) {
+      const auto now = LowStatePhaseGateT::Clock::now();
+      if (!low_state_phase_loss_started_at_) {
         // A timeout has been waiting since phase_wait_start_time, while an
         // expiry is only observed after the control thread resumes. Starting
         // the latter at now ensures one long scheduler delay skips one tick
         // instead of immediately tripping the continuous-loss watchdog.
-        coherent_sensor_pair_loss_started_at_ =
-            reason == SensorPhaseSkipReason::kTimeout ? phase_wait_start_time : now;
+        low_state_phase_loss_started_at_ =
+            reason == LowStatePhaseSkipReason::kTimeout ? phase_wait_start_time : now;
       }
-      const auto no_ready_pair_duration = now - *coherent_sensor_pair_loss_started_at_;
-      if (no_ready_pair_duration >= LOW_STATE_ABSENT_THRESHOLD) {
-        std::cout << "[ERROR] No fresh coherent LowState/torso IMU pair for "
+      const auto no_fresh_low_state_duration = now - *low_state_phase_loss_started_at_;
+      if (no_fresh_low_state_duration >= LOW_STATE_ABSENT_THRESHOLD) {
+        std::cout << "[ERROR] No fresh LowState snapshot for "
                   << LOW_STATE_ABSENT_THRESHOLD.count() << "ms; stopping control." << std::endl;
         operator_state.stop = true;
         return;
       }
 
       if (skipped_count == 1 || skipped_count % 50 == 0) {
-        std::cout << "[WARN] Coherent LowState/torso IMU pair " << reason_text
+        std::cout << "[WARN] LowState phase " << reason_text
                   << "; skipping policy tick (" << skipped_count << " total)" << std::endl;
       }
     }
@@ -3023,30 +3020,34 @@ class G1Deploy {
     /**
      * @brief Read the latest robot state (IMU + joints + hands) and log it.
      *
-     * Consumes the coherent LowState/torso-IMU pair produced by the phase gate,
-     * remaps joint positions from hardware order to IsaacLab order (subtracting
-     * default_angles), and calls StateLogger::LogFullState() with the snapshot.
+     * Consumes the LowState snapshot produced by the phase gate, remaps joint
+     * positions from hardware order to IsaacLab order (subtracting
+     * default_angles), and calls StateLogger::LogFullState(). The secondary
+     * torso IMU remains independently sampled telemetry; it is not part of the
+     * policy phase or observation snapshot.
      *
-     * @return kReady after logging the snapshot, kSensorPairExpired if a
+     * @return kReady after logging the snapshot, kLowStateExpired if a
      *         post-wake scheduling delay made it stale, or kInvalidState if
      *         data is missing or a joint velocity exceeds 35 rad/s.
      */
-    GatherRobotStateResult GatherRobotStateToLogger(const SensorPhaseGate::PairSnapshot& sensor_pair) {
-      const std::shared_ptr<const LowState_> ls = sensor_pair.low_state;
-      const std::shared_ptr<const IMUState_> imu_torso = sensor_pair.torso_imu;
-      if (!ls || !imu_torso) {
-        std::cout << "✗ Error: LowState or IMUState is not available in the middle of the control loop!" << std::endl;
+    GatherRobotStateResult GatherRobotStateToLogger(
+        const LowStatePhaseGateT::Snapshot& low_state_snapshot) {
+      const std::shared_ptr<const LowState_> ls = low_state_snapshot.low_state;
+      if (!ls) {
+        std::cout << "✗ Error: LowState is not available in the middle of the control loop!" << std::endl;
         return GatherRobotStateResult::kInvalidState;
       }
-      if (!SensorPhaseGate::IsFreshPair(
-              sensor_pair, SensorPhaseGate::Clock::now(), LOW_STATE_PHASE_MAX_AGE,
-              SENSOR_PAIR_MAX_RECEIPT_SKEW)) {
-        return GatherRobotStateResult::kSensorPairExpired;
+      if (!LowStatePhaseGateT::IsFreshLowState(
+              low_state_snapshot, LowStatePhaseGateT::Clock::now(), LOW_STATE_PHASE_MAX_AGE)) {
+        return GatherRobotStateResult::kLowStateExpired;
       }
-      used_low_state_data_ = TimestampedData<LowState_>(ls, sensor_pair.low_state_receipt_time);
+      used_low_state_data_ = TimestampedData<LowState_>(ls, low_state_snapshot.receipt_time);
       low_state_age_at_state_snapshot_ms_ = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - used_low_state_data_.timestamp).count();
-      used_imu_torso_data_ = TimestampedData<IMUState_>(imu_torso, sensor_pair.torso_imu_receipt_time);
+      // This telemetry sample intentionally has no bearing on whether a policy
+      // tick runs. A DDS receipt from a separate topic is not atomically paired
+      // with LowState, and no active policy observation consumes it.
+      used_imu_torso_data_ = imu_torso_buffer_.GetDataWithTime();
       // robot state data
       std::array<double, G1_NUM_MOTOR> body_q = {0.0};
       std::array<double, G1_NUM_MOTOR> body_dq = {0.0};
@@ -3126,9 +3127,16 @@ class G1Deploy {
       std::array<double, 3> base_ang_vel = float_to_double<3>(ls->imu_state().gyroscope());
       std::array<double, 3> base_accel = float_to_double<3>(ls->imu_state().accelerometer());
 
-      std::array<double, 4> body_torso_quat = float_to_double<4>(imu_torso->quaternion()); //qw, qx, qy, qz 
-      std::array<double, 3> body_torso_ang_vel = float_to_double<3>(imu_torso->gyroscope());
-      std::array<double, 3> body_torso_accel = float_to_double<3>(imu_torso->accelerometer());
+      // Preserve torso-IMU telemetry for logs and output without making an
+      // absent or independently timed telemetry packet block locomotion.
+      std::array<double, 4> body_torso_quat = {0.0, 0.0, 0.0, 0.0};
+      std::array<double, 3> body_torso_ang_vel = {0.0, 0.0, 0.0};
+      std::array<double, 3> body_torso_accel = {0.0, 0.0, 0.0};
+      if (const std::shared_ptr<const IMUState_> imu_torso = used_imu_torso_data_.data) {
+        body_torso_quat = float_to_double<4>(imu_torso->quaternion());  // qw, qx, qy, qz
+        body_torso_ang_vel = float_to_double<3>(imu_torso->gyroscope());
+        body_torso_accel = float_to_double<3>(imu_torso->accelerometer());
+      }
 
       // Collect hand states from Dex3 hands
       std::array<double, 7> left_hand_q = {0.0};
@@ -4136,25 +4144,28 @@ class G1Deploy {
           }
 
           const auto phase_wait_start_time = std::chrono::steady_clock::now();
-          const auto phase_wait_outcome = low_state_phase_gate_.WaitForFreshPair(
-              LOW_STATE_PHASE_MAX_AGE, SENSOR_PAIR_MAX_RECEIPT_SKEW, LOW_STATE_PHASE_MAX_WAIT);
+          const auto phase_wait_outcome = low_state_phase_gate_.WaitForFreshLowState(
+              LOW_STATE_PHASE_MAX_AGE, LOW_STATE_PHASE_MAX_WAIT);
           const auto phase_wait_duration = std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now() - phase_wait_start_time);
-          if (phase_wait_outcome.result == SensorPhaseGate::Result::kStopped) {
+          if (phase_wait_outcome.result == LowStatePhaseGateT::Result::kStopped) {
             return;
           }
-          if (phase_wait_outcome.result == SensorPhaseGate::Result::kTimeout) {
-            HandleSkippedSensorPhaseTick(SensorPhaseSkipReason::kTimeout, phase_wait_start_time);
+          if (phase_wait_outcome.result == LowStatePhaseGateT::Result::kTimeout) {
+            HandleSkippedLowStatePhaseTick(
+                LowStatePhaseSkipReason::kTimeout, phase_wait_start_time);
             return;
           }
 
           // Revalidate inside GatherRobotStateToLogger immediately before any
-          // snapshot dereference. A post-wake expiry is a skipped tick, not an
-          // immediate shutdown, and shares the continuous-loss watchdog.
-          const auto gather_robot_state_result = GatherRobotStateToLogger(phase_wait_outcome.pair);
-          if (gather_robot_state_result == GatherRobotStateResult::kSensorPairExpired) {
-            HandleSkippedSensorPhaseTick(
-                SensorPhaseSkipReason::kExpiredBeforeConsumption, phase_wait_start_time);
+          // LowState snapshot dereference. A post-wake expiry is a skipped
+          // tick, not an immediate shutdown, and shares the continuous-loss
+          // watchdog.
+          const auto gather_robot_state_result =
+              GatherRobotStateToLogger(phase_wait_outcome.snapshot);
+          if (gather_robot_state_result == GatherRobotStateResult::kLowStateExpired) {
+            HandleSkippedLowStatePhaseTick(
+                LowStatePhaseSkipReason::kExpiredBeforeConsumption, phase_wait_start_time);
             return;
           }
           if (gather_robot_state_result != GatherRobotStateResult::kReady) {
@@ -4163,7 +4174,7 @@ class G1Deploy {
             std::cout << "Stopping control system." << std::endl;
             return;
           }
-          coherent_sensor_pair_loss_started_at_.reset();
+          low_state_phase_loss_started_at_.reset();
 
           // Obs timing starts after the bounded sensor-phase wait and state snapshot.
           auto obs_start_time = std::chrono::steady_clock::now();
