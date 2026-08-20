@@ -74,6 +74,7 @@
 #include <cstdio>
 #include <csignal>
 #include <thread>
+#include <utility>
 
 namespace {
 
@@ -115,6 +116,7 @@ bool ShutdownSignalRequested() noexcept {
 
 // Math utilities
 #include "../include/math_utils.hpp"
+#include "../include/command_freshness_fence.hpp"
 #include "../include/heading_reference_anchor.hpp"
 #include "../include/low_state_phase_gate.hpp"
 
@@ -197,6 +199,8 @@ class G1Deploy {
     /// State machine for the control loop lifecycle.
     enum class ProgramState { INIT, WAIT_FOR_CONTROL, CONTROL };
     using LowStatePhaseGateT = LowStatePhaseGate<LowState_>;
+    using PhasedMotorCommand = PhasedCommand<MotorCommand>;
+    using CommandFreshnessFenceT = CommandFreshnessFence<MotorCommand>;
     enum class LowStatePhaseSkipReason { kTimeout, kExpiredBeforeConsumption };
     enum class GatherRobotStateResult { kReady, kLowStateExpired, kInvalidState };
     
@@ -311,7 +315,11 @@ class G1Deploy {
     HeadingReferenceAnchor heading_reference_anchor_;
 
     DataBuffer<LowState_> low_state_buffer_;
-    DataBuffer<MotorCommand> motor_command_buffer_;
+    // Command and its immutable LowState provenance move through one buffer
+    // so the 500 Hz writer cannot observe a command and receipt from different
+    // control ticks. command_freshness_fence_ is owned by that writer.
+    DataBuffer<PhasedMotorCommand> motor_command_buffer_;
+    CommandFreshnessFenceT command_freshness_fence_;
     DataBuffer<IMUState_> imu_torso_buffer_;
     DataBuffer<HeadingState> heading_state_buffer_;
     DataBuffer<MovementState> movement_state_buffer_;
@@ -2835,33 +2843,56 @@ class G1Deploy {
       }
     }
 
-    /**
-     * @brief Command-writer thread body (500 Hz).
-     *
-     * Reads the latest MotorCommand from motor_command_buffer_, packs it
-     * into a LowCmd_ DDS message with CRC, and publishes via DDS.
-     * Also publishes Dex3 hand commands at the same cadence.
-     */
-    void LowCommandWriter() {
+    [[nodiscard]] MotorCommand MakeDampingCommand() const {
+      MotorCommand motor_command_tmp;
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        motor_command_tmp.tau_ff.at(i) = 0.0;
+        motor_command_tmp.q_target.at(i) = 0.0;
+        motor_command_tmp.dq_target.at(i) = 0.0;
+        motor_command_tmp.kp.at(i) = 0;
+        motor_command_tmp.kd.at(i) = 8;
+      }
+      return motor_command_tmp;
+    }
+
+    /// Pack and publish one already-selected motor command.
+    void WriteMotorCommand(const MotorCommand& motor_command) {
       LowCmd_ dds_low_command;
       dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
       dds_low_command.mode_machine() = mode_machine_;
 
-      const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
-      if (mc) {
-        for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
-          dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
-          dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
-          dds_low_command.motor_cmd().at(i).q() = mc->q_target.at(i);
-          dds_low_command.motor_cmd().at(i).dq() = mc->dq_target.at(i);
-          dds_low_command.motor_cmd().at(i).kp() = mc->kp.at(i);
-          dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i);
-        }
+      for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
+        dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
+        dds_low_command.motor_cmd().at(i).tau() = motor_command.tau_ff.at(i);
+        dds_low_command.motor_cmd().at(i).q() = motor_command.q_target.at(i);
+        dds_low_command.motor_cmd().at(i).dq() = motor_command.dq_target.at(i);
+        dds_low_command.motor_cmd().at(i).kp() = motor_command.kp.at(i);
+        dds_low_command.motor_cmd().at(i).kd() = motor_command.kd.at(i);
+      }
 
-        SanitizeLowCommand(dds_low_command);
+      SanitizeLowCommand(dds_low_command);
 
-        dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-        lowcmd_publisher_->Write(dds_low_command);
+      dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
+      lowcmd_publisher_->Write(dds_low_command);
+    }
+
+    /**
+     * @brief Command-writer thread body (500 Hz).
+     *
+     * The writer evaluates the LowState receipt embedded in the command
+     * envelope on every tick. A missing, future, expired, or regressing
+     * command is replaced here with continuous known damping rather than
+     * replaying an old full-gain command.
+     */
+    void LowCommandWriter() {
+      const std::shared_ptr<const PhasedMotorCommand> envelope =
+          motor_command_buffer_.GetDataWithTime().data;
+      const MotorCommand damping_command = MakeDampingCommand();
+      const auto decision = command_freshness_fence_.Evaluate(envelope);
+      if (decision.IsAccepted()) {
+        WriteMotorCommand(envelope->command);
+      } else {
+        WriteMotorCommand(damping_command);
       }
 
       // Publish Dex3 hand commands at the same publish cadence
@@ -2890,19 +2921,40 @@ class G1Deploy {
       std::cout << "Stop" << std::endl;
     }
 
-    /// Write a zero-torque, damping-only motor command (safe shutdown pose).
+    /// Invalidate any full-gain lease so the writer emits its own damping command.
     void CreateDampingCommand() {
-      MotorCommand motor_command_tmp;
-      const std::shared_ptr<const LowState_> ls = low_state_buffer_.GetDataWithTime().data;
+      motor_command_buffer_.Clear();
+    }
 
+    /// Publish a command together with the immutable LowState source phase.
+    void PublishPhasedMotorCommand(MotorCommand motor_command,
+                                   const LowStatePhaseGateT::Snapshot& phase_snapshot) {
+      motor_command_buffer_.SetData(PhasedMotorCommand{
+          .command = std::move(motor_command),
+          .source_low_state_receipt = phase_snapshot.receipt_time,
+          .source_generation = phase_snapshot.generation,
+      });
+    }
+
+    /// Renew the neutral default-pose lease while waiting for an operator start.
+    bool PublishStandHoldLease() {
+      const auto phase_wait_outcome = low_state_phase_gate_.WaitForFreshLowState(
+          CommandFreshnessFenceT::kMaxCommandAge, std::chrono::milliseconds::zero());
+      if (phase_wait_outcome.result != LowStatePhaseGateT::Result::kReady ||
+          !phase_wait_outcome.snapshot.HasLowState()) {
+        return false;
+      }
+
+      MotorCommand motor_command_tmp;
       for (int i = 0; i < G1_NUM_MOTOR; ++i) {
         motor_command_tmp.tau_ff.at(i) = 0.0;
-        motor_command_tmp.q_target.at(i) = 0.0;
+        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i]);
         motor_command_tmp.dq_target.at(i) = 0.0;
-        motor_command_tmp.kp.at(i) = 0;
-        motor_command_tmp.kd.at(i) = 8;
+        motor_command_tmp.kp.at(i) = kps[i];
+        motor_command_tmp.kd.at(i) = kds[i];
       }
-      motor_command_buffer_.SetData(motor_command_tmp);
+      PublishPhasedMotorCommand(std::move(motor_command_tmp), phase_wait_outcome.snapshot);
+      return true;
     }
 
     /**
@@ -2914,11 +2966,14 @@ class G1Deploy {
      * @return True once LowState data is available; false if not yet ready.
      */
     bool InitControl() {
-      auto low_state_data = low_state_buffer_.GetDataWithTime();
-      const std::shared_ptr<const LowState_> ls = low_state_data.data;
-      if (!ls) {
+      const auto phase_wait_outcome = low_state_phase_gate_.WaitForFreshLowState(
+          CommandFreshnessFenceT::kMaxCommandAge, std::chrono::milliseconds::zero());
+      if (phase_wait_outcome.result != LowStatePhaseGateT::Result::kReady ||
+          !phase_wait_outcome.snapshot.HasLowState()) {
         return false;
       }
+      const LowStatePhaseGateT::Snapshot& phase_snapshot = phase_wait_outcome.snapshot;
+      const std::shared_ptr<const LowState_> ls = phase_snapshot.low_state;
       MotorCommand motor_command_tmp;
       for (int i = 0; i < G1_NUM_MOTOR; ++i) {
         motor_command_tmp.tau_ff.at(i) = 0.0;
@@ -2943,7 +2998,7 @@ class G1Deploy {
         dex3_hands_.open(false);
         std::cout << "Init Done" << std::endl;
       }
-      motor_command_buffer_.SetData(motor_command_tmp);
+      PublishPhasedMotorCommand(std::move(motor_command_tmp), phase_snapshot);
       return true;
     }
 
@@ -3350,7 +3405,7 @@ class G1Deploy {
      * then maps the action output (IsaacLab order) to a MotorCommand
      * (hardware order) using `g1_action_scale` and `default_angles`.
      */
-    bool CreatePolicyCommand() {
+    bool CreatePolicyCommand(const LowStatePhaseGateT::Snapshot& phase_snapshot) {
       // Convert double observation to float and populate policy's internal input buffer
       auto& obs_buffer_float = policy_engine_->GetInputBuffer();
       for (size_t i = 0; i < obs_buffer_.size(); i++) { 
@@ -3404,7 +3459,7 @@ class G1Deploy {
           motor_command_tmp.kd.at(motor_index) = kds[motor_index] * kOverlayArmKdScale;
         }
       }
-      motor_command_buffer_.SetData(motor_command_tmp);
+      PublishPhasedMotorCommand(std::move(motor_command_tmp), phase_snapshot);
       return true;
     }
 
@@ -4118,6 +4173,11 @@ class G1Deploy {
             break;
           }
 
+          // A fresh LowState-renewed lease keeps the neutral stand hold valid
+          // while idle. If the control producer stalls here, the writer sees
+          // the old receipt age out and switches itself to damping.
+          PublishStandHoldLease();
+
           // Re-publish robot_config so late-joining subscribers can receive it
           // before the policy is activated (ZMQ PUB has no persistence).
           for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
@@ -4268,7 +4328,7 @@ class G1Deploy {
 
           auto obs_end_time = std::chrono::steady_clock::now();
 
-          if (!CreatePolicyCommand()) {
+          if (!CreatePolicyCommand(phase_wait_outcome.snapshot)) {
             std::cout << "✗ Error: Failed to create policy command in the middle of the control loop!" << std::endl;
             std::cout << "Stopping control system." << std::endl;
             operator_state.stop = true;
