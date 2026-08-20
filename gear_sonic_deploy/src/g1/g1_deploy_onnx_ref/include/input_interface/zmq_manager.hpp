@@ -250,6 +250,22 @@ class ZMQManager : public InputInterface {
 
             if (new_mode == ManagedMode::PLANNER) {
               std::cout << "[ZMQManager] Switched to: PLANNER mode (safety reset)" << std::endl;
+              // Release the teleop-delegation latch. switch_from_teleop_to_planner_
+              // is set on every switch to STREAMED_MOTION and had NO reset path
+              // anywhere, and it only has any effect while active_mode_ ==
+              // PLANNER (STREAMED_MOTION already satisfies the first clause of
+              // those getters). Its sole purpose is to keep serving teleop data
+              // for the brief window after leaving teleop until the locomotion
+              // planner reports ready. A manipulation-only /sequence is IDLE, so
+              // the planner is deliberately never readied (see the deferral
+              // below) and that window never closed: every getter guarded by it
+              // -- crucially GetHandPose -- kept reading pose_interface_'s empty
+              // buffers and returned {false, zeros}, so the fingers were
+              // commanded open forever after the first release. GetUpperBody* is
+              // not overridden here, so the arms kept working off this object's
+              // own correctly-decoded state; that asymmetry is exactly the
+              // measured upper=1/hands=0 signature (MULTI-315).
+              switch_from_teleop_to_planner_ = false;
               if (latest_planner_message_.valid) {
                 constexpr auto PLANNER_MESSAGE_TIMEOUT = std::chrono::milliseconds(100);
                 auto time_since_last_planner = std::chrono::steady_clock::now() - latest_planner_message_.timestamp;
@@ -266,6 +282,23 @@ class ZMQManager : public InputInterface {
             } else if (new_mode == ManagedMode::STREAMED_MOTION) {
               std::cout << "[ZMQManager] Switched to: STREAMED MOTION mode (safety reset)" << std::endl;
               trigger_zmq_toggle = true;
+
+              // Disarm the manipulation overlay. Unlike the PLANNER branch
+              // above, this used to leave has_upper_body_control_/
+              // has_hand_joints_ at whatever the last planner message set
+              // them to -- true, indefinitely, since neither flag is reset
+              // anywhere except here or an actual ESTOP/stop. The overlay in
+              // g1_deploy_onnx_ref.cpp gates solely on has_upper_body_control_
+              // and reads upper_body_joint_positions_/velocities_, a
+              // DataBuffer with no expiry (utils.hpp) -- so the boosted
+              // 4x-kp/2x-kd manipulation gains and a stale frozen arm target
+              // silently kept overriding 14 arm joints under normal
+              // MotionBricks locomotion after the very first arm/hand
+              // excursion of the process's life, contaminating every
+              // subsequent excursion and even in-process re-arm attempts
+              // (only a full process restart ever cleared it).
+              has_upper_body_control_ = false;
+              has_hand_joints_ = false;
 
               // Clear planner buffer when switching away from planner mode
               {
@@ -497,8 +530,36 @@ class ZMQManager : public InputInterface {
             auto current_facing = movement_state_buffer.GetDataWithTime().data->facing_direction;
             std::cout << "[ZMQManager] Safety reset: Planner kept enabled with current state" << std::endl;
           } else {
+            // Respect the SAME deliberate IDLE deferral the start path below
+            // enforces ("Enabling the planner for IDLE can generate a
+            // non-neutral pose ... defer planner startup until the first
+            // non-IDLE intent arrives"). This handler used to enable the
+            // locomotion planner unconditionally, so a manipulation-only
+            // /sequence -- which carries mode=IDLE and only wants the
+            // upper-body overlay -- silently swapped the neutral boot-stand
+            // reference for a planner-generated planner_motion on its FIRST
+            // excursion. Every excursion after that then took the
+            // "planner already on, keep it as is" branch above and set
+            // play=true on that non-neutral reference, destabilizing the
+            // robot regardless of which arm moved (MULTI-315). Manipulation
+            // overlays are independent of the locomotion planner, so an IDLE
+            // intent should just keep CONTROL balance-holding the reference;
+            // the lazy-enable path below still brings the planner up the
+            // moment a genuine locomotion intent arrives.
+            bool intent_is_locomotion = false;
+            {
+              std::lock_guard<std::mutex> lock(planner_mutex_);
+              intent_is_locomotion =
+                latest_planner_message_.valid &&
+                latest_planner_message_.mode != static_cast<int>(LocomotionMode::IDLE);
+            }
+            if (!intent_is_locomotion) {
+              std::cout << "[ZMQManager] Safety reset: IDLE intent -- keeping neutral reference stand, planner deferred" << std::endl;
+              return;
+            }
+
             // Planner was disabled, set initial movement state
-            movement_state_buffer.SetData(MovementState(static_cast<int>(LocomotionMode::IDLE), 
+            movement_state_buffer.SetData(MovementState(static_cast<int>(LocomotionMode::IDLE),
                                                         {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, -1.0f, -1.0f));
 
             // Now enable planner

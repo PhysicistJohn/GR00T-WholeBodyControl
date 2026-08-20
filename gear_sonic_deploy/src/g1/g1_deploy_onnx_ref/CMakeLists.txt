@@ -62,6 +62,12 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     if(NOT THOR_POS EQUAL -1)
       set(IS_THOR TRUE)
     endif()
+  elseif(EXISTS "/sys/devices/virtual/dmi/id/product_name")
+    file(READ "/sys/devices/virtual/dmi/id/product_name" DEVICE_PRODUCT_NAME)
+    string(STRIP "${DEVICE_PRODUCT_NAME}" DEVICE_PRODUCT_NAME)
+    if(DEVICE_PRODUCT_NAME STREQUAL "NVIDIA_DGX_Spark")
+      set(IS_THOR TRUE)
+    endif()
   endif()
 
   # ARM/Jetson platform - conditionally add DLA support
@@ -86,7 +92,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
   # DLA support: only for non-Thor Jetson devices
   if(IS_THOR)
     set(CUDLA_LIBRARY "")
-    message(STATUS "🚀 ARM64 (Thor) detected - building without DLA support")
+    message(STATUS "🚀 ARM64 platform without DLA detected")
     message(STATUS "   Using CUDA library path: ${CUDA_ARM_LIB_PATH}")
     message(STATUS "   Thor doesn't have DLA engines")
   else()
@@ -178,6 +184,34 @@ set(EXE_INCLUDES
   ${ZMQ_INCLUDE_DIR}
   ${EIGEN3_INCLUDE_DIR}
 )
+
+add_executable(low_state_phase_gate_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/low_state_phase_gate_test.cpp)
+target_include_directories(low_state_phase_gate_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/)
+target_link_libraries(low_state_phase_gate_test PRIVATE Threads::Threads)
+set_target_properties(low_state_phase_gate_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+
+add_executable(streamed_motion_merger_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/streamed_motion_merger_test.cpp)
+target_include_directories(streamed_motion_merger_test PRIVATE ${EXE_INCLUDES})
+set_target_properties(streamed_motion_merger_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+
+add_executable(heading_reference_anchor_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/heading_reference_anchor_test.cpp)
+target_include_directories(heading_reference_anchor_test PRIVATE ${EXE_INCLUDES})
+set_target_properties(heading_reference_anchor_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
 
 
 # Build a static library, used by both the main executable and the tests: 

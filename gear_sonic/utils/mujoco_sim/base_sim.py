@@ -45,6 +45,14 @@ except ImportError:
     handsim_bus = None
 
 try:
+    # Same PYTHONPATH story as handsim_bus above -- converts measured Revo2
+    # actuator radians to the normalized [0,1] representation the hand-state
+    # publisher below shares with unitree-g1-handsim's grasp consumers.
+    import revo2_hand
+except ImportError:
+    revo2_hand = None
+
+try:
     # Optional, same PYTHONPATH story as handsim_bus above: lets a world's
     # scene.json point "mjcf_room" at a standalone, fully-authored MJCF room
     # (e.g. keysight_lab_mujoco/keysight_lab.xml) instead of describing it as
@@ -97,6 +105,35 @@ def _is_robot_hand_contact(body_name: str, geom_name: str) -> bool:
         re.search(r"(^|[_\s])hand($|[_\s])", label)
         or any(token in label for token in ("finger", "thumb", "wrist"))
     )
+
+
+_HAND_FINGER_CONTACT_GEOM_RE = re.compile(
+    r"^(left|right)_hand_(thumb|index|middle|ring|pinky)_"
+    r"(?:metacarpal|proximal|distal)_contact_\d+$"
+)
+_HAND_PALM_CONTACT_GEOM_RE = re.compile(r"^(left|right)_hand_palm_contact_\d+$")
+
+
+def _build_hand_contact_geom_map(mj_model) -> dict:
+    """Map side -> finger group -> set(geom_id), from the Revo2 contact-geom
+    naming convention emitted by scripts/build_wbc_revo2_scene.py (e.g.
+    right_hand_index_distal_contact_0, right_hand_palm_contact_1). Built once
+    at init so hand-contact detection never depends on a tracked manipulation
+    object existing in the scene."""
+    groups: dict[str, dict[str, set[int]]] = {
+        "left": {g: set() for g in ("thumb", "index", "middle", "ring", "pinky", "palm")},
+        "right": {g: set() for g in ("thumb", "index", "middle", "ring", "pinky", "palm")},
+    }
+    for gid in range(mj_model.ngeom):
+        name = mj_model.geom(gid).name
+        m = _HAND_FINGER_CONTACT_GEOM_RE.match(name)
+        if m:
+            groups[m.group(1)][m.group(2)].add(gid)
+            continue
+        m = _HAND_PALM_CONTACT_GEOM_RE.match(name)
+        if m:
+            groups[m.group(1)]["palm"].add(gid)
+    return groups
 
 
 def _default_handsim_world_config_path() -> Path:
@@ -1043,6 +1080,11 @@ class DefaultEnv:
         if self.manipulation_objects:
             print(f"[handsim-manipulation] objects={list(self.manipulation_objects)}", flush=True)
 
+        # Independent of manipulation_objects -- real hand state should
+        # publish whether or not a pick object exists in the scene.
+        self._hand_contact_geoms = _build_hand_contact_geom_map(self.mj_model)
+        self._hand_state_next_publish = 0.0
+
     def _poll_manipulation_command(self) -> None:
         if handsim_bus is None or not self.manipulation_objects:
             return
@@ -1145,6 +1187,61 @@ class DefaultEnv:
             }
         try:
             handsim_bus.publish_state(handsim_bus.MANIPULATION_OBJECTS, payload)
+        except Exception:
+            pass
+
+    def _publish_hand_state(self) -> None:
+        """Real measured Revo2 finger qpos + per-finger contact, independent
+        of any tracked manipulation object -- unitree-g1-handsim's grasp
+        consumers (e.g. scripts/vla_pick.py) have no other way to observe
+        what the hand is actually doing versus what it was last commanded."""
+        if handsim_bus is None or revo2_hand is None:
+            return
+        now = time.time()
+        if now < self._hand_state_next_publish:
+            return
+        self._hand_state_next_publish = now + 1.0 / 30.0
+
+        finger_force = {
+            side: {group: 0.0 for group in groups}
+            for side, groups in self._hand_contact_geoms.items()
+        }
+        finger_contact = {
+            side: {group: False for group in groups}
+            for side, groups in self._hand_contact_geoms.items()
+        }
+        geom_to_side_group = {
+            gid: (side, group)
+            for side, groups in self._hand_contact_geoms.items()
+            for group, gids in groups.items()
+            for gid in gids
+        }
+        for index in range(self.mj_data.ncon):
+            contact = self.mj_data.contact[index]
+            hit = geom_to_side_group.get(int(contact.geom1)) or geom_to_side_group.get(int(contact.geom2))
+            if hit is None:
+                continue
+            side, group = hit
+            force = np.zeros(6, dtype=np.float64)
+            mujoco.mj_contactForce(self.mj_model, self.mj_data, index, force)
+            finger_contact[side][group] = True
+            finger_force[side][group] += float(abs(force[0]))
+
+        payload = {"ts": now}
+        for side, hand_index in (("left", self.left_hand_index), ("right", self.right_hand_index)):
+            radians = self.mj_data.qpos[hand_index + self.qpos_offset - 1]
+            payload[side] = {
+                "qpos_normalized": list(revo2_hand.radians_to_normalized(radians)),
+                "fingers": {
+                    group: {
+                        "contact": finger_contact[side][group],
+                        "force_n": finger_force[side][group],
+                    }
+                    for group in self._hand_contact_geoms[side]
+                },
+            }
+        try:
+            handsim_bus.publish_state(handsim_bus.HAND_STATE, payload)
         except Exception:
             pass
 
@@ -1437,6 +1534,7 @@ class DefaultEnv:
             self.mj_data.ctrl = self.torques
         mujoco.mj_step(self.mj_model, self.mj_data)
         self._publish_manipulation_state()
+        self._publish_hand_state()
 
         self.check_fall()
 

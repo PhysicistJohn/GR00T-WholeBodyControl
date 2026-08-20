@@ -137,6 +137,22 @@ public:
         int frame_step = CalculateFrameStep(data.frame_indices);
         int incoming_frame_start = static_cast<int>(data.frame_indices[0]);
         int incoming_frame_end = static_cast<int>(data.frame_indices[data.num_frames - 1]);
+
+        // A real-time PUB/SUB stream may deliver a stale packet after the
+        // playback window has already advanced. Replacing the window with that
+        // packet used to report a catch-up reset, which also reinitialized the
+        // robot heading. Ignore it and keep the current window instead.
+        if (streamed_motion_ && streamed_motion_->timesteps > 0) {
+            int stream_window_end =
+                stream_window_start_ + frame_step * (streamed_motion_->timesteps - 1);
+            if (incoming_frame_end <= stream_window_end) {
+                result.motion = streamed_motion_;
+                result.window_start = stream_window_start_;
+                result.frame_step = frame_step;
+                result.protocol_version = data.protocol_version;
+                return result;
+            }
+        }
         
         if constexpr (DEBUG_LOGGING) {
             std::cout << "[StreamedMotionMerger] Processing " << data.num_frames << " frames, "
@@ -327,10 +343,16 @@ private:
         int delta_to_incoming = incoming_frame_start - tentative_window_start;
         int tentative_merge_dst = (frame_step > 0) ? (delta_to_incoming / frame_step) : 0;
         
-        // Check for large gap
-        bool large_gap_from_old = incoming_frame_start > stream_window_end + frame_step;
+        // A one-frame publisher is allowed to lose a small number of packets.
+        // Jump its playback cursor to the newest pose without changing the
+        // heading anchor. Only a genuinely large discontinuity denotes a new
+        // stream/session and warrants heading reinitialization.
+        int missing_frames = std::max(
+            0,
+            (incoming_frame_start - stream_window_end) / std::max(1, frame_step) - 1
+        );
         
-        if (tentative_merge_dst > max_gap_frames || large_gap_from_old) {
+        if (tentative_merge_dst > max_gap_frames || missing_frames > max_gap_frames) {
             // Catch-up: reset window to incoming frame
             new_window_start = incoming_frame_start;
             merge_dst_frame = 0;
@@ -339,6 +361,11 @@ private:
             if constexpr (DEBUG_LOGGING) {
                 std::cout << "[StreamedMotionMerger] CATCH-UP: gap too large or old data expired" << std::endl;
             }
+        } else if (missing_frames > 0) {
+            // Cursor catch-up only. did_catchup deliberately remains false so
+            // ZMQEndpointInterface keeps the original physical heading anchor.
+            new_window_start = incoming_frame_start;
+            merge_dst_frame = 0;
         } else {
             // Normal merge
             new_window_start = tentative_window_start;

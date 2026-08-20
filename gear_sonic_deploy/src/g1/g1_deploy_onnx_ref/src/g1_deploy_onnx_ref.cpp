@@ -29,6 +29,11 @@
  *   - **CONTROL**: Active policy execution – gather observations, infer actions,
  *     write motor commands.  Exits on operator "stop" or error.
  *
+ * ## Process Shutdown
+ *
+ * SIGINT and SIGTERM only set an async-signal-safe handoff flag.  The main
+ * loop observes that flag and calls G1Deploy::Stop() outside signal context.
+ *
  * ## CLI Arguments (selected)
  *
  *   Flag                  | Description
@@ -48,10 +53,9 @@
 #include <cmath>
 #include <cuda_runtime_api.h>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <shared_mutex>
-#include <pthread.h>
-#include <sched.h>
 #include <array>
 #include <vector>
 #include <algorithm>
@@ -68,7 +72,27 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstdio>
+#include <csignal>
 #include <thread>
+
+namespace {
+
+volatile std::sig_atomic_t g_shutdown_signal_requested = 0;
+
+void ShutdownSignalHandler(int) noexcept {
+  g_shutdown_signal_requested = 1;
+}
+
+void InstallShutdownSignalHandlers() {
+  std::signal(SIGINT, ShutdownSignalHandler);
+  std::signal(SIGTERM, ShutdownSignalHandler);
+}
+
+bool ShutdownSignalRequested() noexcept {
+  return g_shutdown_signal_requested != 0;
+}
+
+}  // namespace
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -91,6 +115,8 @@
 
 // Math utilities
 #include "../include/math_utils.hpp"
+#include "../include/heading_reference_anchor.hpp"
+#include "../include/low_state_phase_gate.hpp"
 
 // Observation configuration
 #include "../include/observation_config.hpp"
@@ -170,6 +196,9 @@ class G1Deploy {
   private:
     /// State machine for the control loop lifecycle.
     enum class ProgramState { INIT, WAIT_FOR_CONTROL, CONTROL };
+    using SensorPhaseGate = LowStatePhaseGate<LowState_, IMUState_>;
+    enum class SensorPhaseSkipReason { kTimeout, kExpiredBeforeConsumption };
+    enum class GatherRobotStateResult { kReady, kSensorPairExpired, kInvalidState };
     
     // =========================================================================
     // Core timing, mode, and counters
@@ -279,13 +308,14 @@ class G1Deploy {
     bool high_temp_warning_ = false;
     std::string high_temp_message_;
 
-    std::array<double, 4> init_ref_data_root_rot_array_;
+    HeadingReferenceAnchor heading_reference_anchor_;
 
     DataBuffer<LowState_> low_state_buffer_;
     DataBuffer<MotorCommand> motor_command_buffer_;
     DataBuffer<IMUState_> imu_torso_buffer_;
     DataBuffer<HeadingState> heading_state_buffer_;
     DataBuffer<MovementState> movement_state_buffer_;
+    SensorPhaseGate low_state_phase_gate_;
     
     ChannelPublisherPtr<LowCmd_> lowcmd_publisher_;
     ChannelSubscriberPtr<LowState_> lowstate_subscriber_;
@@ -314,6 +344,9 @@ class G1Deploy {
     // =========================================================================
     static constexpr std::chrono::milliseconds LOW_STATE_LATE_THRESHOLD{50};
     static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
+    static constexpr std::chrono::milliseconds LOW_STATE_PHASE_MAX_AGE{1};
+    static constexpr std::chrono::milliseconds SENSOR_PAIR_MAX_RECEIPT_SKEW{2};
+    static constexpr std::chrono::milliseconds LOW_STATE_PHASE_MAX_WAIT{10};
     ProgramState program_state_;
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
@@ -352,6 +385,10 @@ class G1Deploy {
     int logging_counter_ = 0;
     TimestampedData<LowState_> used_low_state_data_;
     TimestampedData<IMUState_> used_imu_torso_data_;
+    double low_state_age_at_state_snapshot_ms_ = -1.0;
+    std::uint64_t low_state_phase_timeout_count_ = 0;
+    std::uint64_t low_state_phase_expired_before_consumption_count_ = 0;
+    std::optional<std::chrono::steady_clock::time_point> coherent_sensor_pair_loss_started_at_;
 
     // State logger
     std::unique_ptr<StateLogger> state_logger_;
@@ -569,7 +606,8 @@ class G1Deploy {
      * @brief Update heading state — must be called once per control tick BEFORE gathering observations.
      *
      * Handles heading reinitialisation (when operator triggers reset) and
-     * ensures init_ref_data_root_rot_array_ is set when starting from frame 0.
+     * captures the reference anchor once, then only recaptures it when an
+     * explicit heading reset is requested.
      * This shared state is consumed by all orientation observation functions.
      */
     void UpdateHeadingState() {
@@ -585,18 +623,19 @@ class G1Deploy {
         heading_state_buffer_.SetData(HeadingState(base_quat, 0.0));
         reinitialize_heading_ = false;
         const auto motion_body_quat_init = current_motion_->BodyQuaternions(current_frame_);
-        init_ref_data_root_rot_array_ = motion_body_quat_init[0];
+        heading_reference_anchor_.Capture(motion_body_quat_init[0]);
+        const auto& init_ref_data_root_rot_array = heading_reference_anchor_.Orientation();
         std::cout << "Reset heading state to " << base_quat[0] << ", " << base_quat[1] << ", " << base_quat[2] << ", " << base_quat[3] << std::endl;
         std::cout << "Reset delta heading to 0" << std::endl;
-        std::cout << "Reset init reference data root rotation to current frame: " << init_ref_data_root_rot_array_[0] << ", " << init_ref_data_root_rot_array_[1] << ", " << init_ref_data_root_rot_array_[2] << ", " << init_ref_data_root_rot_array_[3] << std::endl;
+        std::cout << "Reset init reference data root rotation to current frame: " << init_ref_data_root_rot_array[0] << ", " << init_ref_data_root_rot_array[1] << ", " << init_ref_data_root_rot_array[2] << ", " << init_ref_data_root_rot_array[3] << std::endl;
         std::cout << "**********************************************************" << std::endl;
         std::cout << "Reference motion name: " << current_motion_->name << std::endl;
         std::cout << "**********************************************************" << std::endl;
       }
 
-      if (current_frame_ == 0) {
-        const auto motion_body_quat_init = current_motion_->BodyQuaternions(0);
-        init_ref_data_root_rot_array_ = motion_body_quat_init[0];
+      if (!heading_reference_anchor_.IsInitialized()) {
+        const auto motion_body_quat_init = current_motion_->BodyQuaternions(current_frame_);
+        heading_reference_anchor_.CaptureIfNeeded(motion_body_quat_init[0]);
       }
     }
 
@@ -604,14 +643,14 @@ class G1Deploy {
      * @brief Compute the apply_delta_heading quaternion from current heading state.
      *
      * This is a pure computation with no side effects — safe to call from any
-     * observation function. Reads heading_state_buffer_ and init_ref_data_root_rot_array_.
+     * observation function. Reads heading_state_buffer_ and the stable reference anchor.
      */
     std::array<double, 4> ComputeApplyDeltaHeading() {
       auto heading_state_data = heading_state_buffer_.GetDataWithTime().data;
       HeadingState heading_state = heading_state_data ? *heading_state_data : HeadingState();
 
       auto init_heading = calc_heading_quat_d(heading_state.init_base_quat);
-      auto data_heading_inv = calc_heading_quat_inv_d(init_ref_data_root_rot_array_);
+      auto data_heading_inv = calc_heading_quat_inv_d(heading_reference_anchor_.Orientation());
       auto apply_delta_heading = quat_mul_d(init_heading, data_heading_inv);
 
       if (heading_state.delta_heading != 0.0) {
@@ -2609,8 +2648,8 @@ class G1Deploy {
         planner_thread_ptr_ =
           CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, planner_dt_ * 1e6, &G1Deploy::Planner, this);
       }
-          
-      SetThreadPriority();
+      // Recurrent workers retain the SDK/runtime SCHED_OTHER policy and the
+      // container-provided CPU set.  Do not alter the constructor thread here.
     }
 
     /// Disable the body_dq > 35 rad/s abort (bench/debug only; never on hardware).
@@ -2687,20 +2726,12 @@ class G1Deploy {
       return true;
     }
 
-    void SetThreadPriority() {
-      struct sched_param param;
-      param.sched_priority = sched_get_priority_max(SCHED_FIFO);
-      pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
-      cpu_set_t cpuset;
-      CPU_ZERO(&cpuset);
-      CPU_SET(0, &cpuset);
-      pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-    }
-
-    /// DDS callback: receives a 500 Hz LowState message from the robot SDK.
+    /// DDS callback: receives LowState at 200 Hz in this simulation and commonly
+    /// 500 Hz from hardware.  Valid messages are paired with torso IMU receipts.
     /// Validates CRC (unless disabled for MuJoCo sim) and stores the result
     /// in the thread-safe low_state_buffer_.
     void LowStateHandler(const void* message) {
+      const auto receipt_time = SensorPhaseGate::Clock::now();
       LowState_ low_state = *(const LowState_*)message;
 
       // Only perform CRC check if not disabled (for MuJoCo simulation compatibility)
@@ -2734,12 +2765,15 @@ class G1Deploy {
         if (mode_machine_ == 0) std::cout << "G1 type: " << unsigned(low_state.mode_machine()) << std::endl;
         mode_machine_ = low_state.mode_machine();
       }
+      low_state_phase_gate_.NotifyLowState(low_state, receipt_time);
     }
 
     /// DDS callback: receives secondary (torso) IMU data.
     void imuTorsoHandler(const void* message) {
+      const auto receipt_time = SensorPhaseGate::Clock::now();
       IMUState_ imu_torso = *(const IMUState_*)message;
       imu_torso_buffer_.SetData(imu_torso);
+      low_state_phase_gate_.NotifyTorsoImu(imu_torso, receipt_time);
     }
 
     /**
@@ -2840,6 +2874,7 @@ class G1Deploy {
     /// Gracefully stop all threads and send a damping-only command.
     void Stop() {
       operator_state.stop = true;
+      low_state_phase_gate_.Stop();
 
       if (control_thread_ptr_) {
         input_thread_ptr_->Wait();
@@ -2933,6 +2968,40 @@ class G1Deploy {
       return true;
     }
 
+    /// Account for a skipped policy tick without treating one late wake as a shutdown.
+    void HandleSkippedSensorPhaseTick(
+        SensorPhaseSkipReason reason, SensorPhaseGate::Clock::time_point phase_wait_start_time) {
+      const std::uint64_t skipped_count =
+          reason == SensorPhaseSkipReason::kTimeout
+              ? ++low_state_phase_timeout_count_
+              : ++low_state_phase_expired_before_consumption_count_;
+      const char* const reason_text = reason == SensorPhaseSkipReason::kTimeout
+                                          ? "phase timeout"
+                                          : "expired before consumption";
+
+      const auto now = SensorPhaseGate::Clock::now();
+      if (!coherent_sensor_pair_loss_started_at_) {
+        // A timeout has been waiting since phase_wait_start_time, while an
+        // expiry is only observed after the control thread resumes. Starting
+        // the latter at now ensures one long scheduler delay skips one tick
+        // instead of immediately tripping the continuous-loss watchdog.
+        coherent_sensor_pair_loss_started_at_ =
+            reason == SensorPhaseSkipReason::kTimeout ? phase_wait_start_time : now;
+      }
+      const auto no_ready_pair_duration = now - *coherent_sensor_pair_loss_started_at_;
+      if (no_ready_pair_duration >= LOW_STATE_ABSENT_THRESHOLD) {
+        std::cout << "[ERROR] No fresh coherent LowState/torso IMU pair for "
+                  << LOW_STATE_ABSENT_THRESHOLD.count() << "ms; stopping control." << std::endl;
+        operator_state.stop = true;
+        return;
+      }
+
+      if (skipped_count == 1 || skipped_count % 50 == 0) {
+        std::cout << "[WARN] Coherent LowState/torso IMU pair " << reason_text
+                  << "; skipping policy tick (" << skipped_count << " total)" << std::endl;
+      }
+    }
+
     /// Get current ROS 2 timestamp (seconds) from the first ROS2 output interface, or 0.0 if none.
     double GetRosTimestamp() {
       // Get ROS timestamp from the first ROS2 output interface (0.0 if none available)
@@ -2954,24 +3023,30 @@ class G1Deploy {
     /**
      * @brief Read the latest robot state (IMU + joints + hands) and log it.
      *
-     * Reads LowState and torso IMU from their DataBuffers, remaps joint positions
-     * from hardware order to IsaacLab order (subtracting default_angles), and
-     * calls StateLogger::LogFullState() with the complete snapshot.
+     * Consumes the coherent LowState/torso-IMU pair produced by the phase gate,
+     * remaps joint positions from hardware order to IsaacLab order (subtracting
+     * default_angles), and calls StateLogger::LogFullState() with the snapshot.
      *
-     * @return False if LowState or IMU data is missing or a joint velocity
-     *         exceeds the safety threshold (35 rad/s).
+     * @return kReady after logging the snapshot, kSensorPairExpired if a
+     *         post-wake scheduling delay made it stale, or kInvalidState if
+     *         data is missing or a joint velocity exceeds 35 rad/s.
      */
-    bool GatherRobotStateToLogger() {
-      auto low_state_data = low_state_buffer_.GetDataWithTime();
-      auto imu_data = imu_torso_buffer_.GetDataWithTime();
-      const std::shared_ptr<const LowState_> ls = low_state_data.data;
-      const std::shared_ptr<const IMUState_> imu_torso = imu_data.data;
+    GatherRobotStateResult GatherRobotStateToLogger(const SensorPhaseGate::PairSnapshot& sensor_pair) {
+      const std::shared_ptr<const LowState_> ls = sensor_pair.low_state;
+      const std::shared_ptr<const IMUState_> imu_torso = sensor_pair.torso_imu;
       if (!ls || !imu_torso) {
         std::cout << "✗ Error: LowState or IMUState is not available in the middle of the control loop!" << std::endl;
-        return false;
+        return GatherRobotStateResult::kInvalidState;
       }
-      used_low_state_data_ = (low_state_data);
-      used_imu_torso_data_ = (imu_data);
+      if (!SensorPhaseGate::IsFreshPair(
+              sensor_pair, SensorPhaseGate::Clock::now(), LOW_STATE_PHASE_MAX_AGE,
+              SENSOR_PAIR_MAX_RECEIPT_SKEW)) {
+        return GatherRobotStateResult::kSensorPairExpired;
+      }
+      used_low_state_data_ = TimestampedData<LowState_>(ls, sensor_pair.low_state_receipt_time);
+      low_state_age_at_state_snapshot_ms_ = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - used_low_state_data_.timestamp).count();
+      used_imu_torso_data_ = TimestampedData<IMUState_>(imu_torso, sensor_pair.torso_imu_receipt_time);
       // robot state data
       std::array<double, G1_NUM_MOTOR> body_q = {0.0};
       std::array<double, G1_NUM_MOTOR> body_dq = {0.0};
@@ -2987,7 +3062,7 @@ class G1Deploy {
         if (body_dq[i] > 35 && !disable_velocity_guard_) {
           std::cout << "✗ Error: body_dq[" << i << "] = " << body_dq[i] << " > 35."
                     << std::endl;
-          return false;
+          return GatherRobotStateResult::kInvalidState;
         }
         // Extract motor temperature (2 values per motor: winding, driver) in hardware order
         motor_temperature[i * 2]     = static_cast<double>(unitree_joint_state[i].temperature()[0]);
@@ -3096,7 +3171,7 @@ class G1Deploy {
                                     std::span(last_right_hand_action),
                                     ros_timestamp);
       }
-      return true;
+      return GatherRobotStateResult::kReady;
     }
 
     /**
@@ -4060,17 +4135,40 @@ class G1Deploy {
             break;
           }
 
-          // NEW: Get data with timestamps for loop timing analysis
-          auto obs_start_time = std::chrono::steady_clock::now();
-          // Increment independent logging counter every control iteration
-          logging_counter_++;
+          const auto phase_wait_start_time = std::chrono::steady_clock::now();
+          const auto phase_wait_outcome = low_state_phase_gate_.WaitForFreshPair(
+              LOW_STATE_PHASE_MAX_AGE, SENSOR_PAIR_MAX_RECEIPT_SKEW, LOW_STATE_PHASE_MAX_WAIT);
+          const auto phase_wait_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - phase_wait_start_time);
+          if (phase_wait_outcome.result == SensorPhaseGate::Result::kStopped) {
+            return;
+          }
+          if (phase_wait_outcome.result == SensorPhaseGate::Result::kTimeout) {
+            HandleSkippedSensorPhaseTick(SensorPhaseSkipReason::kTimeout, phase_wait_start_time);
+            return;
+          }
 
-          if (!GatherRobotStateToLogger()) {
+          // Revalidate inside GatherRobotStateToLogger immediately before any
+          // snapshot dereference. A post-wake expiry is a skipped tick, not an
+          // immediate shutdown, and shares the continuous-loss watchdog.
+          const auto gather_robot_state_result = GatherRobotStateToLogger(phase_wait_outcome.pair);
+          if (gather_robot_state_result == GatherRobotStateResult::kSensorPairExpired) {
+            HandleSkippedSensorPhaseTick(
+                SensorPhaseSkipReason::kExpiredBeforeConsumption, phase_wait_start_time);
+            return;
+          }
+          if (gather_robot_state_result != GatherRobotStateResult::kReady) {
             std::cout << "✗ Error: Failed to gather robot state to logger in the middle of the control loop!" << std::endl;
             operator_state.stop = true;
             std::cout << "Stopping control system." << std::endl;
             return;
           }
+          coherent_sensor_pair_loss_started_at_.reset();
+
+          // Obs timing starts after the bounded sensor-phase wait and state snapshot.
+          auto obs_start_time = std::chrono::steady_clock::now();
+          // Increment independent logging counter every successful control iteration
+          logging_counter_++;
 
           // Handle temperature report request (F key)
           if (report_temperature_) {
@@ -4193,7 +4291,7 @@ class G1Deploy {
             if (output_interface) {
               output_interface->publish(
                 vr_3point_position_buffer_, vr_3point_orientation_buffer_, vr_3point_compliance_buffer_,
-                left_hand_joint_buffer_, right_hand_joint_buffer_, init_ref_data_root_rot_array_,
+                left_hand_joint_buffer_, right_hand_joint_buffer_, heading_reference_anchor_.Orientation(),
                 heading_state_buffer_, current_motion_copy, current_frame_copy
               );
             }
@@ -4269,7 +4367,11 @@ class G1Deploy {
             auto motor_command_duration = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_start_time);
             auto post_hand_joint_duration = std::chrono::duration_cast<std::chrono::microseconds>(control_loop_end_time - hand_joint_end_time);
             
-            std::cout << "Loop timing - LowState age: " << used_low_state_data_.GetAgeMs() << "ms"
+            std::cout << "Loop timing - LowState age at snapshot: " << low_state_age_at_state_snapshot_ms_ << "ms"
+                      << ", Phase wait: " << phase_wait_duration.count() << "us"
+                      << ", Phase timeouts: " << low_state_phase_timeout_count_
+                      << ", Expired before consumption: "
+                      << low_state_phase_expired_before_consumption_count_
                       << ", Streaming data mean delay: " << streaming_data_delay_rolling_stats_.mean() << "ms"
                       << ", Streaming data std delay: " << streaming_data_delay_rolling_stats_.stddev() << "ms"
                       << ", IMU age: " << used_imu_torso_data_.GetAgeMs() << "ms"
@@ -4314,7 +4416,8 @@ class G1Deploy {
  *   3. motion_data_path  – Directory of pre-loaded reference motions
  *
  * All other arguments are optional flags (see --help for full list).
- * The main loop sleeps until the operator issues a stop signal or ROS2 shuts down.
+ * The main loop sleeps until the operator issues a stop signal, SIGINT/SIGTERM
+ * requests graceful shutdown, or ROS2 shuts down.
  */
 int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program starting..." << std::endl;
@@ -4639,6 +4742,10 @@ int main(int argc, char const* argv[]) {
     }
   }
 
+  // Install before robot I/O and worker threads are created.  The handler only
+  // records a signal; the loop below performs the actual shutdown work.
+  InstallShutdownSignalHandlers();
+
   std::cout << "[DEBUG] Creating G1Deploy object..." << std::endl;
   G1Deploy custom(
     networkInterface,
@@ -4676,23 +4783,27 @@ int main(int argc, char const* argv[]) {
   // Main application loop - check both operator_state.stop and ROS2 status if using ROS2
 #if HAS_ROS2
   if (inputType == "ros2") {
-    while (!custom.operator_state.stop && rclcpp::ok()) { 
-      sleep(0.02); 
+    while (!custom.operator_state.stop && !ShutdownSignalRequested() && rclcpp::ok()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     if (!rclcpp::ok()) {
       std::cout << "[INFO] ROS2 shutdown detected (Ctrl+C)" << std::endl;
     }
   } else {
-    while (!custom.operator_state.stop) { sleep(0.02); }
+    while (!custom.operator_state.stop && !ShutdownSignalRequested()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
   }
 #else
-  while (!custom.operator_state.stop) { sleep(0.02); }
+  while (!custom.operator_state.stop && !ShutdownSignalRequested()) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
 #endif
   
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;
   custom.Stop();
   std::cout << "[DEBUG] Waiting for cleanup..." << std::endl;
-  sleep(0.5);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }

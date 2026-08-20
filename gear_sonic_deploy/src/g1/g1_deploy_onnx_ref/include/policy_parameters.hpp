@@ -141,69 +141,69 @@ const std::array<double, 29> g1_action_scale = {
 // PID control gains - Position gains (Kp)
 // These values are computed based on the stiffness constants above
 const std::array<float, 29> kps = {
-    STIFFNESS_7520_22, // left_hip_pitch_joint (old is 7520_14 new is 7520_22）
-    STIFFNESS_7520_22, // left_hip_roll_joint
-    STIFFNESS_7520_14, // left_hip_yaw_joint
-    STIFFNESS_7520_22, // left_knee_joint
-    2.0 * STIFFNESS_5020, // left_ankle_pitch_joint
-    2.0 * STIFFNESS_5020, // left_ankle_roll_joint
-    STIFFNESS_7520_22, // right_hip_pitch_joint (old is 7520_14 new is 7520_22）
-    STIFFNESS_7520_22, // right_hip_roll_joint
-    STIFFNESS_7520_14, // right_hip_yaw_joint
-    STIFFNESS_7520_22, // right_knee_joint
-    2.0 * STIFFNESS_5020, // right_ankle_pitch_joint
-    2.0 * STIFFNESS_5020, // right_ankle_roll_joint
-    STIFFNESS_7520_14, // waist_yaw_joint
-    2.0 * STIFFNESS_5020, // waist_roll_joint
-    2.0 * STIFFNESS_5020, // waist_pitch_joint
-    STIFFNESS_5020, // left_shoulder_pitch_joint
-    STIFFNESS_5020, // left_shoulder_roll_joint
-    STIFFNESS_5020, // left_shoulder_yaw_joint
-    STIFFNESS_5020, // left_elbow_joint
-    STIFFNESS_5020, // left_wrist_roll_joint
-    STIFFNESS_4010, // left_wrist_pitch_joint
-    STIFFNESS_4010, // left_wrist_yaw_joint
-    STIFFNESS_5020, // right_shoulder_pitch_joint
-    STIFFNESS_5020, // right_shoulder_roll_joint
-    STIFFNESS_5020, // right_shoulder_yaw_joint
-    STIFFNESS_5020, // right_elbow_joint
-    STIFFNESS_5020, // right_wrist_roll_joint
-    STIFFNESS_4010, // right_wrist_pitch_joint
-    STIFFNESS_4010, // right_wrist_yaw_joint
+    static_cast<float>(STIFFNESS_7520_22), // left_hip_pitch_joint (old is 7520_14 new is 7520_22）
+    static_cast<float>(STIFFNESS_7520_22), // left_hip_roll_joint
+    static_cast<float>(STIFFNESS_7520_14), // left_hip_yaw_joint
+    static_cast<float>(STIFFNESS_7520_22), // left_knee_joint
+    static_cast<float>(2.0 * STIFFNESS_5020), // left_ankle_pitch_joint
+    static_cast<float>(2.0 * STIFFNESS_5020), // left_ankle_roll_joint
+    static_cast<float>(STIFFNESS_7520_22), // right_hip_pitch_joint (old is 7520_14 new is 7520_22）
+    static_cast<float>(STIFFNESS_7520_22), // right_hip_roll_joint
+    static_cast<float>(STIFFNESS_7520_14), // right_hip_yaw_joint
+    static_cast<float>(STIFFNESS_7520_22), // right_knee_joint
+    static_cast<float>(2.0 * STIFFNESS_5020), // right_ankle_pitch_joint
+    static_cast<float>(2.0 * STIFFNESS_5020), // right_ankle_roll_joint
+    static_cast<float>(STIFFNESS_7520_14), // waist_yaw_joint
+    static_cast<float>(2.0 * STIFFNESS_5020), // waist_roll_joint
+    static_cast<float>(2.0 * STIFFNESS_5020), // waist_pitch_joint
+    static_cast<float>(STIFFNESS_5020), // left_shoulder_pitch_joint
+    static_cast<float>(STIFFNESS_5020), // left_shoulder_roll_joint
+    static_cast<float>(STIFFNESS_5020), // left_shoulder_yaw_joint
+    static_cast<float>(STIFFNESS_5020), // left_elbow_joint
+    static_cast<float>(STIFFNESS_5020), // left_wrist_roll_joint
+    static_cast<float>(STIFFNESS_4010), // left_wrist_pitch_joint
+    static_cast<float>(STIFFNESS_4010), // left_wrist_yaw_joint
+    static_cast<float>(STIFFNESS_5020), // right_shoulder_pitch_joint
+    static_cast<float>(STIFFNESS_5020), // right_shoulder_roll_joint
+    static_cast<float>(STIFFNESS_5020), // right_shoulder_yaw_joint
+    static_cast<float>(STIFFNESS_5020), // right_elbow_joint
+    static_cast<float>(STIFFNESS_5020), // right_wrist_roll_joint
+    static_cast<float>(STIFFNESS_4010), // right_wrist_pitch_joint
+    static_cast<float>(STIFFNESS_4010), // right_wrist_yaw_joint
 };
 
 // PID control gains - Derivative gains (Kd)
 // These values are computed based on the damping constants above
 const std::array<float, 29> kds = {
-    DAMPING_7520_22, // left_hip_pitch_joint (old is 7520_14 new is 7520_22）
-    DAMPING_7520_22, // left_hip_roll_joint
-    DAMPING_7520_14, // left_hip_yaw_joint
-    DAMPING_7520_22, // left_knee_joint
-    2.0 * DAMPING_5020, // left_ankle_pitch_joint
-    2.0 * DAMPING_5020, // left_ankle_roll_joint
-    DAMPING_7520_22, // right_hip_pitch_joint (old is 7520_14 new is 7520_22）
-    DAMPING_7520_22, // right_hip_roll_joint
-    DAMPING_7520_14, // right_hip_yaw_joint
-    DAMPING_7520_22, // right_knee_joint
-    2.0 * DAMPING_5020, // right_ankle_pitch_joint
-    2.0 * DAMPING_5020, // right_ankle_roll_joint
-    DAMPING_7520_14, // waist_yaw_joint
-    2.0 * DAMPING_5020, // waist_roll_joint
-    2.0 * DAMPING_5020, // waist_pitch_joint
-    DAMPING_5020, // left_shoulder_pitch_joint
-    DAMPING_5020, // left_shoulder_roll_joint
-    DAMPING_5020, // left_shoulder_yaw_joint
-    DAMPING_5020, // left_elbow_joint
-    DAMPING_5020, // left_wrist_roll_joint
-    DAMPING_4010, // left_wrist_pitch_joint
-    DAMPING_4010, // left_wrist_yaw_joint
-    DAMPING_5020, // right_shoulder_pitch_joint
-    DAMPING_5020, // right_shoulder_roll_joint
-    DAMPING_5020, // right_shoulder_yaw_joint
-    DAMPING_5020, // right_elbow_joint
-    DAMPING_5020, // right_wrist_roll_joint
-    DAMPING_4010, // right_wrist_pitch_joint
-    DAMPING_4010, // right_wrist_yaw_joint
+    static_cast<float>(DAMPING_7520_22), // left_hip_pitch_joint (old is 7520_14 new is 7520_22）
+    static_cast<float>(DAMPING_7520_22), // left_hip_roll_joint
+    static_cast<float>(DAMPING_7520_14), // left_hip_yaw_joint
+    static_cast<float>(DAMPING_7520_22), // left_knee_joint
+    static_cast<float>(2.0 * DAMPING_5020), // left_ankle_pitch_joint
+    static_cast<float>(2.0 * DAMPING_5020), // left_ankle_roll_joint
+    static_cast<float>(DAMPING_7520_22), // right_hip_pitch_joint (old is 7520_14 new is 7520_22）
+    static_cast<float>(DAMPING_7520_22), // right_hip_roll_joint
+    static_cast<float>(DAMPING_7520_14), // right_hip_yaw_joint
+    static_cast<float>(DAMPING_7520_22), // right_knee_joint
+    static_cast<float>(2.0 * DAMPING_5020), // right_ankle_pitch_joint
+    static_cast<float>(2.0 * DAMPING_5020), // right_ankle_roll_joint
+    static_cast<float>(DAMPING_7520_14), // waist_yaw_joint
+    static_cast<float>(2.0 * DAMPING_5020), // waist_roll_joint
+    static_cast<float>(2.0 * DAMPING_5020), // waist_pitch_joint
+    static_cast<float>(DAMPING_5020), // left_shoulder_pitch_joint
+    static_cast<float>(DAMPING_5020), // left_shoulder_roll_joint
+    static_cast<float>(DAMPING_5020), // left_shoulder_yaw_joint
+    static_cast<float>(DAMPING_5020), // left_elbow_joint
+    static_cast<float>(DAMPING_5020), // left_wrist_roll_joint
+    static_cast<float>(DAMPING_4010), // left_wrist_pitch_joint
+    static_cast<float>(DAMPING_4010), // left_wrist_yaw_joint
+    static_cast<float>(DAMPING_5020), // right_shoulder_pitch_joint
+    static_cast<float>(DAMPING_5020), // right_shoulder_roll_joint
+    static_cast<float>(DAMPING_5020), // right_shoulder_yaw_joint
+    static_cast<float>(DAMPING_5020), // right_elbow_joint
+    static_cast<float>(DAMPING_5020), // right_wrist_roll_joint
+    static_cast<float>(DAMPING_4010), // right_wrist_pitch_joint
+    static_cast<float>(DAMPING_4010), // right_wrist_yaw_joint
 };
 
 // Joint position limits (rad), hardware motor order, extracted from
@@ -275,15 +275,15 @@ const std::array<float, 29> q_upper_limits = {
 // Feedforward torque ceiling per joint (Nm), mirroring the motor-family
 // mapping of the gain tables (ankles/waist roll+pitch are dual-5020).
 const std::array<float, 29> tau_ff_limits = {
-    EFFORT_LIMIT_7520_22, EFFORT_LIMIT_7520_22, EFFORT_LIMIT_7520_14,
-    EFFORT_LIMIT_7520_22, 2.0 * EFFORT_LIMIT_5020, 2.0 * EFFORT_LIMIT_5020,
-    EFFORT_LIMIT_7520_22, EFFORT_LIMIT_7520_22, EFFORT_LIMIT_7520_14,
-    EFFORT_LIMIT_7520_22, 2.0 * EFFORT_LIMIT_5020, 2.0 * EFFORT_LIMIT_5020,
-    EFFORT_LIMIT_7520_14, 2.0 * EFFORT_LIMIT_5020, 2.0 * EFFORT_LIMIT_5020,
-    EFFORT_LIMIT_5020, EFFORT_LIMIT_5020, EFFORT_LIMIT_5020,
-    EFFORT_LIMIT_5020, EFFORT_LIMIT_5020, EFFORT_LIMIT_4010, EFFORT_LIMIT_4010,
-    EFFORT_LIMIT_5020, EFFORT_LIMIT_5020, EFFORT_LIMIT_5020,
-    EFFORT_LIMIT_5020, EFFORT_LIMIT_5020, EFFORT_LIMIT_4010, EFFORT_LIMIT_4010,
+    static_cast<float>(EFFORT_LIMIT_7520_22), static_cast<float>(EFFORT_LIMIT_7520_22), static_cast<float>(EFFORT_LIMIT_7520_14),
+    static_cast<float>(EFFORT_LIMIT_7520_22), static_cast<float>(2.0 * EFFORT_LIMIT_5020), static_cast<float>(2.0 * EFFORT_LIMIT_5020),
+    static_cast<float>(EFFORT_LIMIT_7520_22), static_cast<float>(EFFORT_LIMIT_7520_22), static_cast<float>(EFFORT_LIMIT_7520_14),
+    static_cast<float>(EFFORT_LIMIT_7520_22), static_cast<float>(2.0 * EFFORT_LIMIT_5020), static_cast<float>(2.0 * EFFORT_LIMIT_5020),
+    static_cast<float>(EFFORT_LIMIT_7520_14), static_cast<float>(2.0 * EFFORT_LIMIT_5020), static_cast<float>(2.0 * EFFORT_LIMIT_5020),
+    static_cast<float>(EFFORT_LIMIT_5020), static_cast<float>(EFFORT_LIMIT_5020), static_cast<float>(EFFORT_LIMIT_5020),
+    static_cast<float>(EFFORT_LIMIT_5020), static_cast<float>(EFFORT_LIMIT_5020), static_cast<float>(EFFORT_LIMIT_4010), static_cast<float>(EFFORT_LIMIT_4010),
+    static_cast<float>(EFFORT_LIMIT_5020), static_cast<float>(EFFORT_LIMIT_5020), static_cast<float>(EFFORT_LIMIT_5020),
+    static_cast<float>(EFFORT_LIMIT_5020), static_cast<float>(EFFORT_LIMIT_5020), static_cast<float>(EFFORT_LIMIT_4010), static_cast<float>(EFFORT_LIMIT_4010),
 };
 
 // Max q_target slew rate (rad/s) at the 500 Hz command writer. Matches the
