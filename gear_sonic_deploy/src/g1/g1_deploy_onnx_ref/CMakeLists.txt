@@ -205,6 +205,16 @@ set_target_properties(command_freshness_fence_test PROPERTIES
   CXX_STANDARD_REQUIRED ON
   CXX_EXTENSIONS OFF)
 
+add_executable(event_periodic_wake_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/event_periodic_wake_test.cpp)
+target_include_directories(event_periodic_wake_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/)
+target_link_libraries(event_periodic_wake_test PRIVATE Threads::Threads)
+set_target_properties(event_periodic_wake_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+
 add_executable(streamed_motion_merger_test
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/streamed_motion_merger_test.cpp)
 target_include_directories(streamed_motion_merger_test PRIVATE ${EXE_INCLUDES})

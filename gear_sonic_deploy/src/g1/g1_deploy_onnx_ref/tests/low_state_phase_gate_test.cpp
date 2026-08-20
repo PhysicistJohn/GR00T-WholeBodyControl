@@ -74,6 +74,33 @@ void TestStaleLowStateIsRejected() {
          "a stale LowState must not be accepted");
 }
 
+void TestPolicyWaitRequiresANewerGeneration() {
+  PhaseGate gate;
+  const auto receipt = PhaseGate::Clock::now() - 1ms;
+  gate.NotifyLowState({7}, receipt);
+
+  const auto first = gate.WaitForNewLowState(0, 1s, 0ms);
+  Expect(first.result == PhaseGate::Result::kReady,
+         "the first unseen LowState generation must be accepted");
+  Expect(first.snapshot.generation == 1,
+         "the first LowState callback must produce generation one");
+  Expect(first.snapshot.gate_wake_time >= first.snapshot.receipt_time,
+         "the returned gate-wake time must share the receipt clock");
+
+  const auto reused = gate.WaitForNewLowState(first.snapshot.generation, 1s, 0ms);
+  Expect(reused.result == PhaseGate::Result::kTimeout,
+         "a policy consumer must never reuse a fresh LowState generation");
+
+  gate.NotifyLowState({8});
+  const auto next = gate.WaitForNewLowState(first.snapshot.generation, 1s, 0ms);
+  Expect(next.result == PhaseGate::Result::kReady,
+         "a callback with a strictly newer generation must wake the policy gate");
+  Expect(next.snapshot.generation > first.snapshot.generation,
+         "the policy gate must advance generation before returning a new snapshot");
+  Expect(next.snapshot.low_state->sequence == 8,
+         "the new policy phase must carry the new immutable LowState payload");
+}
+
 void TestNotificationRaceDoesNotLoseWake() {
   // Notify immediately after the waiter announces that it is about to enter
   // the gate.  The notification may land before or after the waiter takes the
@@ -150,6 +177,7 @@ int main() {
   TestFreshLowStateNeedsNoSecondaryTelemetry();
   TestFreshnessBoundariesArePure();
   TestStaleLowStateIsRejected();
+  TestPolicyWaitRequiresANewerGeneration();
   TestNotificationRaceDoesNotLoseWake();
   TestStopIsTerminal();
   TestStopUnblocksWait();

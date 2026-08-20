@@ -38,6 +38,10 @@ class LowStatePhaseGate {
     std::shared_ptr<const LowStateT> low_state;
     std::uint64_t generation = 0;
     Clock::time_point receipt_time{};
+    // This is populated only on the copy returned to a consumer. It records
+    // when the phase gate declared this particular generation ready; it is not
+    // a property of the DDS payload itself.
+    Clock::time_point gate_wake_time{};
 
     [[nodiscard]] bool HasLowState() const { return low_state != nullptr; }
   };
@@ -66,12 +70,10 @@ class LowStatePhaseGate {
   /**
    * Wait for an immutable LowState snapshot no older than @p max_receipt_age.
    *
-   * A fresh snapshot already present at entry returns immediately.  Otherwise
-   * the method captures the generation under the mutex and waits for it to
-   * advance.  Receipt age, rather than an arbitrary timer-entry boundary,
-   * defines freshness.  Keeping the captured generation and the
-   * condition-variable predicate under this lock closes the check-then-wait
-   * notification race.
+   * A fresh snapshot already present at entry returns immediately. This is
+   * suitable for non-phased inspection only. Policy command producers must
+   * instead use WaitForNewLowState() so they cannot consume one LowState
+   * generation twice.
    */
   [[nodiscard]] WaitOutcome WaitForFreshLowState(Duration max_receipt_age,
                                                    Duration max_wait) {
@@ -80,24 +82,61 @@ class LowStatePhaseGate {
     std::unique_lock<std::mutex> lock(mutex_);
 
     if (stopped_) {
-      return {Result::kStopped, snapshot_};
+      return MakeOutcomeLocked(Result::kStopped, Clock::now());
     }
 
-    if (IsFreshLowStateLocked(Clock::now(), max_receipt_age)) {
-      return {Result::kReady, snapshot_};
+    const auto initial_now = Clock::now();
+    if (IsFreshLowStateLocked(initial_now, max_receipt_age)) {
+      return MakeOutcomeLocked(Result::kReady, initial_now);
     }
 
     for (;;) {
       if (stopped_) {
-        return {Result::kStopped, snapshot_};
+        return MakeOutcomeLocked(Result::kStopped, Clock::now());
       }
 
       const auto now = Clock::now();
       if (IsFreshLowStateLocked(now, max_receipt_age)) {
-        return {Result::kReady, snapshot_};
+        return MakeOutcomeLocked(Result::kReady, now);
       }
       if (now >= deadline) {
-        return {Result::kTimeout, snapshot_};
+        return MakeOutcomeLocked(Result::kTimeout, now);
+      }
+
+      const std::uint64_t observed_generation = snapshot_.generation;
+      cv_.wait_until(lock, deadline, [&] {
+        return stopped_ || snapshot_.generation != observed_generation;
+      });
+    }
+  }
+
+  /**
+   * Wait for a fresh LowState generation strictly newer than @p last_generation.
+   *
+   * This is the policy-phase API. A merely fresh snapshot that has already
+   * supplied a motor-command envelope is never returned again. The generation
+   * comparison and wait predicate share the mutex, so a callback that arrives
+   * between the comparison and sleep cannot be lost. The returned snapshot's
+   * gate_wake_time is sampled on the same steady clock as receipt_time.
+   */
+  [[nodiscard]] WaitOutcome WaitForNewLowState(std::uint64_t last_generation,
+                                                Duration max_receipt_age,
+                                                Duration max_wait) {
+    const auto deadline = Clock::now() +
+                          (max_wait < Duration::zero() ? Duration::zero() : max_wait);
+    std::unique_lock<std::mutex> lock(mutex_);
+
+    for (;;) {
+      const auto now = Clock::now();
+      if (stopped_) {
+        return MakeOutcomeLocked(Result::kStopped, now);
+      }
+      if (snapshot_.generation > last_generation &&
+          IsFreshLowStateLocked(now, max_receipt_age)) {
+        return MakeOutcomeLocked(Result::kReady, now);
+      }
+      if (now >= deadline) {
+        return MakeOutcomeLocked(Result::kTimeout, now);
       }
 
       const std::uint64_t observed_generation = snapshot_.generation;
@@ -133,6 +172,13 @@ class LowStatePhaseGate {
   }
 
  private:
+  [[nodiscard]] WaitOutcome MakeOutcomeLocked(Result result,
+                                               Clock::time_point gate_wake_time) const {
+    Snapshot snapshot = snapshot_;
+    snapshot.gate_wake_time = gate_wake_time;
+    return {result, std::move(snapshot)};
+  }
+
   [[nodiscard]] bool IsFreshLowStateLocked(Clock::time_point now,
                                            Duration max_receipt_age) const {
     return IsFreshLowState(snapshot_, now, max_receipt_age);

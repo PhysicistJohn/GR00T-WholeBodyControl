@@ -10,15 +10,16 @@
  *
  * ## Threading Model
  *
- * Four real-time threads are created by the Unitree SDK's
- * `CreateRecurrentThreadEx`:
+ * Three real-time threads are created by the Unitree SDK's
+ * `CreateRecurrentThreadEx`. The sole command writer is an event-wakeable
+ * standard thread that still maintains its 500 Hz retransmit cadence:
  *
  *   Thread           | Rate     | Method              | Responsibility
  *   -----------------|----------|---------------------|-------------------------------
  *   Input            | 100 Hz   | G1Deploy::Input     | Poll input interface, handle commands.
  *   Control          | 50 Hz    | G1Deploy::Control   | Gather obs, run policy, compute motor targets.
  *   Planner          | 10 Hz    | G1Deploy::Planner   | Re-plan locomotion trajectory.
- *   Command Writer   | 500 Hz   | G1Deploy::LowCommandWriter | Publish motor commands via DDS.
+ *   Command Writer   | event + 500 Hz | G1Deploy::LowCommandWriter | Sole DDS motor-command publisher.
  *
  * ## Control-Loop State Machine (ProgramState)
  *
@@ -117,6 +118,7 @@ bool ShutdownSignalRequested() noexcept {
 // Math utilities
 #include "../include/math_utils.hpp"
 #include "../include/command_freshness_fence.hpp"
+#include "../include/event_periodic_wake.hpp"
 #include "../include/heading_reference_anchor.hpp"
 #include "../include/low_state_phase_gate.hpp"
 
@@ -191,8 +193,9 @@ using namespace unitree_hg::msg::dds_;
  *  - OutputInterface(s) (ZMQ / ROS2 state publishers)
  *  - MotionDataReader (pre-loaded reference motions)
  *
- * Four real-time threads handle Input (100 Hz), Control (50 Hz),
- * Planner (10 Hz), and Command Writing (500 Hz).
+ * SDK recurrent threads handle Input (100 Hz), Control (50 Hz), and Planner
+ * (10 Hz). One event-wakeable thread owns Command Writing (500 Hz maintenance
+ * retransmission plus prompt envelope-change dispatch).
  */
 class G1Deploy {
   private:
@@ -201,6 +204,17 @@ class G1Deploy {
     using LowStatePhaseGateT = LowStatePhaseGate<LowState_>;
     using PhasedMotorCommand = PhasedCommand<MotorCommand>;
     using CommandFreshnessFenceT = CommandFreshnessFence<MotorCommand>;
+    struct PhasedWriteOutcome {
+      CommandFreshnessFenceT::Decision decision;
+      // fence_time exists even when the envelope was rejected before an SDK
+      // call. call_attempt_time is the final pre-call boundary; a deadline
+      // rejection records it even though no SDK call follows. local_return_time
+      // remains zero unless Write() was called.
+      CommandFreshnessFenceT::Clock::time_point fence_time{};
+      CommandFreshnessFenceT::Clock::time_point call_attempt_time{};
+      CommandFreshnessFenceT::Clock::time_point local_return_time{};
+      bool local_write_succeeded = false;
+    };
     enum class LowStatePhaseSkipReason { kTimeout, kExpiredBeforeConsumption };
     enum class GatherRobotStateResult { kReady, kLowStateExpired, kInvalidState };
     
@@ -324,11 +338,18 @@ class G1Deploy {
     DataBuffer<HeadingState> heading_state_buffer_;
     DataBuffer<MovementState> movement_state_buffer_;
     LowStatePhaseGateT low_state_phase_gate_;
+    // Every full-gain envelope, including INIT and idle stand-hold, consumes
+    // one distinct LowState generation. This is owned by the control thread.
+    std::uint64_t last_command_low_state_generation_ = 0;
     
     ChannelPublisherPtr<LowCmd_> lowcmd_publisher_;
     ChannelSubscriberPtr<LowState_> lowstate_subscriber_;
     ChannelSubscriberPtr<IMUState_> imutorso_subscriber_;
-    ThreadPtr input_thread_ptr_, command_writer_ptr_, control_thread_ptr_, planner_thread_ptr_;
+    ThreadPtr input_thread_ptr_, control_thread_ptr_, planner_thread_ptr_;
+    // The writer remains the sole owner of lowcmd_publisher_. Producers only
+    // replace/clear the command envelope and wake this one thread.
+    EventPeriodicWake command_writer_wake_{std::chrono::microseconds{2000}};
+    std::thread command_writer_thread_;
     
     // =========================================================================
     // External clients and peripheral managers
@@ -397,6 +418,23 @@ class G1Deploy {
     std::uint64_t low_state_phase_expired_before_consumption_count_ = 0;
     RollingStats<50> low_state_to_command_phase_us_;
     double low_state_to_command_phase_max_us_ = 0.0;
+    // Writer-owned trace for the complete LowState phase. Each sample is one
+    // successful first local DDS dispatch, never a 500 Hz retransmission of an
+    // old lease. The SDK exposes no robot-arrival timestamp.
+    RollingStats<50> low_state_to_gate_wake_phase_us_;
+    RollingStats<50> gate_wake_to_envelope_phase_us_;
+    RollingStats<50> envelope_to_first_local_call_attempt_phase_us_;
+    RollingStats<50> low_state_to_first_local_call_attempt_phase_us_;
+    RollingStats<50> low_state_to_first_local_return_phase_us_;
+    double low_state_to_gate_wake_phase_max_us_ = 0.0;
+    double gate_wake_to_envelope_phase_max_us_ = 0.0;
+    double envelope_to_first_local_call_attempt_phase_max_us_ = 0.0;
+    double low_state_to_first_local_call_attempt_phase_max_us_ = 0.0;
+    double low_state_to_first_local_return_phase_max_us_ = 0.0;
+    std::uint64_t first_local_dds_phase_sample_count_ = 0;
+    std::uint64_t first_local_dds_phase_deadline_miss_count_ = 0;
+    std::uint64_t local_dds_write_failure_count_ = 0;
+    std::chrono::steady_clock::time_point last_local_dds_write_failure_log_time_{};
     std::optional<std::chrono::steady_clock::time_point> low_state_phase_loss_started_at_;
 
     // State logger
@@ -2648,8 +2686,6 @@ class G1Deploy {
 
       // create threads
       input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6, &G1Deploy::Input, this);
-      command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
-                                                    &G1Deploy::LowCommandWriter, this);
       control_thread_ptr_ =
           CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, control_dt_ * 1e6, &G1Deploy::Control, this);
       
@@ -2657,6 +2693,12 @@ class G1Deploy {
         planner_thread_ptr_ =
           CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, planner_dt_ * 1e6, &G1Deploy::Planner, this);
       }
+      // Start the std::thread only after all fallible SDK thread construction
+      // above has completed; this avoids a joinable thread during constructor
+      // unwinding. It is still the sole DDS writer.
+      command_writer_thread_ = std::thread([this] {
+        command_writer_wake_.Run([this] { LowCommandWriter(); });
+      });
       // Recurrent workers retain the SDK/runtime SCHED_OTHER policy and the
       // container-provided CPU set.  Do not alter the constructor thread here.
     }
@@ -2671,6 +2713,13 @@ class G1Deploy {
 
     ~G1Deploy()
     {
+      // Normal shutdown calls Stop() and has already joined this thread. This
+      // guard prevents std::terminate if destruction follows an exceptional
+      // path after the writer was launched.
+      command_writer_wake_.Stop();
+      if (command_writer_thread_.joinable()) {
+        command_writer_thread_.join();
+      }
       hot_reload_stop_.store(true);
       if (hot_reload_thread_.joinable()) {
         hot_reload_thread_.join();
@@ -2857,9 +2906,8 @@ class G1Deploy {
       return motor_command_tmp;
     }
 
-    /// Pack and publish one already-selected motor command.
-    void WriteMotorCommand(const MotorCommand& motor_command) {
-      LowCmd_ dds_low_command;
+    /// Populate a DDS low command without publishing it.
+    void PopulateLowCommand(const MotorCommand& motor_command, LowCmd_& dds_low_command) const {
       dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
       dds_low_command.mode_machine() = mode_machine_;
 
@@ -2871,30 +2919,255 @@ class G1Deploy {
         dds_low_command.motor_cmd().at(i).kp() = motor_command.kp.at(i);
         dds_low_command.motor_cmd().at(i).kd() = motor_command.kd.at(i);
       }
+    }
+
+    void RecordFirstLocalDdsWrite(
+        const PhasedMotorCommand& envelope,
+        CommandFreshnessFenceT::Clock::time_point call_attempt_time,
+        CommandFreshnessFenceT::Clock::time_point local_return_time) {
+      const auto to_us = [](CommandFreshnessFenceT::Clock::time_point later,
+                            CommandFreshnessFenceT::Clock::time_point earlier) {
+        return std::chrono::duration<double, std::micro>(later - earlier).count();
+      };
+      const double receipt_to_gate_wake_us =
+          to_us(envelope.gate_wake_time, envelope.source_low_state_receipt);
+      const double gate_wake_to_envelope_us =
+          to_us(envelope.envelope_published_time, envelope.gate_wake_time);
+      const double envelope_to_call_attempt_us =
+          to_us(call_attempt_time, envelope.envelope_published_time);
+      const double receipt_to_call_attempt_us =
+          to_us(call_attempt_time, envelope.source_low_state_receipt);
+      const double receipt_to_local_return_us =
+          to_us(local_return_time, envelope.source_low_state_receipt);
+
+      low_state_to_gate_wake_phase_us_.push(receipt_to_gate_wake_us);
+      gate_wake_to_envelope_phase_us_.push(gate_wake_to_envelope_us);
+      envelope_to_first_local_call_attempt_phase_us_.push(envelope_to_call_attempt_us);
+      low_state_to_first_local_call_attempt_phase_us_.push(receipt_to_call_attempt_us);
+      low_state_to_first_local_return_phase_us_.push(receipt_to_local_return_us);
+      low_state_to_gate_wake_phase_max_us_ =
+          std::max(low_state_to_gate_wake_phase_max_us_, receipt_to_gate_wake_us);
+      gate_wake_to_envelope_phase_max_us_ =
+          std::max(gate_wake_to_envelope_phase_max_us_, gate_wake_to_envelope_us);
+      envelope_to_first_local_call_attempt_phase_max_us_ = std::max(
+          envelope_to_first_local_call_attempt_phase_max_us_, envelope_to_call_attempt_us);
+      low_state_to_first_local_call_attempt_phase_max_us_ = std::max(
+          low_state_to_first_local_call_attempt_phase_max_us_, receipt_to_call_attempt_us);
+      low_state_to_first_local_return_phase_max_us_ =
+          std::max(low_state_to_first_local_return_phase_max_us_, receipt_to_local_return_us);
+
+      if (++first_local_dds_phase_sample_count_ < 50) {
+        return;
+      }
+      std::cout << "[SONIC_PHASE] samples=" << first_local_dds_phase_sample_count_
+                << " receipt_to_gate_wake_us_mean=" << low_state_to_gate_wake_phase_us_.mean()
+                << " receipt_to_gate_wake_us_max=" << low_state_to_gate_wake_phase_max_us_
+                << " gate_wake_to_envelope_us_mean=" << gate_wake_to_envelope_phase_us_.mean()
+                << " gate_wake_to_envelope_us_max=" << gate_wake_to_envelope_phase_max_us_
+                << " envelope_to_first_local_dds_call_attempt_us_mean="
+                << envelope_to_first_local_call_attempt_phase_us_.mean()
+                << " envelope_to_first_local_dds_call_attempt_us_max="
+                << envelope_to_first_local_call_attempt_phase_max_us_
+                << " receipt_to_first_local_dds_call_attempt_us_mean="
+                << low_state_to_first_local_call_attempt_phase_us_.mean()
+                << " receipt_to_first_local_dds_call_attempt_us_max="
+                << low_state_to_first_local_call_attempt_phase_max_us_
+                << " receipt_to_first_local_dds_return_us_mean="
+                << low_state_to_first_local_return_phase_us_.mean()
+                << " receipt_to_first_local_dds_return_us_max="
+                << low_state_to_first_local_return_phase_max_us_
+                << " first_write_budget_us="
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       CommandFreshnessFenceT::kMaxFirstWritePhase)
+                       .count()
+                << " hardware_arrival=unavailable"
+                << std::endl;
+      first_local_dds_phase_sample_count_ = 0;
+      low_state_to_gate_wake_phase_us_.clear();
+      gate_wake_to_envelope_phase_us_.clear();
+      envelope_to_first_local_call_attempt_phase_us_.clear();
+      low_state_to_first_local_call_attempt_phase_us_.clear();
+      low_state_to_first_local_return_phase_us_.clear();
+      low_state_to_gate_wake_phase_max_us_ = 0.0;
+      gate_wake_to_envelope_phase_max_us_ = 0.0;
+      envelope_to_first_local_call_attempt_phase_max_us_ = 0.0;
+      low_state_to_first_local_call_attempt_phase_max_us_ = 0.0;
+      low_state_to_first_local_return_phase_max_us_ = 0.0;
+    }
+
+    void RecordPhaseDeadlineMiss(const PhasedMotorCommand& envelope,
+                                 CommandFreshnessFenceT::Clock::time_point fence_time) {
+      ++first_local_dds_phase_deadline_miss_count_;
+      if (first_local_dds_phase_deadline_miss_count_ == 1 ||
+          first_local_dds_phase_deadline_miss_count_ % 50 == 0) {
+        const double receipt_to_fence_us =
+            std::chrono::duration<double, std::micro>(
+                fence_time - envelope.source_low_state_receipt)
+                .count();
+        std::cout << "[WARN] SONIC first local DDS phase deadline missed for LowState generation "
+                  << envelope.source_generation << " receipt_to_fence_us="
+                  << receipt_to_fence_us << "; writing damping ("
+                  << first_local_dds_phase_deadline_miss_count_ << " total; "
+                  << "hardware_arrival=unavailable)" << std::endl;
+      }
+    }
+
+    void RecordLocalDdsWriteFailure(
+        const char* command_kind,
+        std::optional<std::uint64_t> source_generation,
+        CommandFreshnessFenceT::Clock::time_point call_attempt_time,
+        CommandFreshnessFenceT::Clock::time_point local_return_time) {
+      ++local_dds_write_failure_count_;
+      const auto now = CommandFreshnessFenceT::Clock::now();
+      if (local_dds_write_failure_count_ != 1 &&
+          now - last_local_dds_write_failure_log_time_ < std::chrono::seconds(1)) {
+        return;
+      }
+      last_local_dds_write_failure_log_time_ = now;
+      const auto call_duration_us = std::chrono::duration<double, std::micro>(
+                                        local_return_time - call_attempt_time)
+                                        .count();
+      std::cout << "[WARN] SONIC local DDS Write() failed kind=" << command_kind;
+      if (source_generation.has_value()) {
+        std::cout << " low_state_generation=" << *source_generation;
+      }
+      std::cout << " local_call_duration_us=" << call_duration_us
+                << " failures_total=" << local_dds_write_failure_count_
+                << " hardware_arrival=unavailable" << std::endl;
+    }
+
+    /// Pack and publish one damping or otherwise unphased motor command.
+    /// The result is deliberately observed even though this path has no source
+    /// generation that can be terminally fenced.
+    void WriteMotorCommand(const MotorCommand& motor_command) {
+      const auto q_targets_before_sanitize = last_sent_q_target_;
+      const bool had_q_targets_before_sanitize = has_last_sent_q_target_;
+      const uint64_t sanitize_events_before = sanitize_events_total_;
+      const auto sanitize_log_time_before = last_sanitize_log_time_;
+
+      LowCmd_ dds_low_command;
+      PopulateLowCommand(motor_command, dds_low_command);
 
       SanitizeLowCommand(dds_low_command);
 
       dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-      lowcmd_publisher_->Write(dds_low_command);
+      const auto call_attempt_time = CommandFreshnessFenceT::Clock::now();
+      const bool local_write_succeeded = lowcmd_publisher_->Write(dds_low_command);
+      const auto local_return_time = CommandFreshnessFenceT::Clock::now();
+      if (!local_write_succeeded) {
+        // A failed damping write published nothing. Restore every sanitizer
+        // field that describes the last successfully published q-target.
+        last_sent_q_target_ = q_targets_before_sanitize;
+        has_last_sent_q_target_ = had_q_targets_before_sanitize;
+        sanitize_events_total_ = sanitize_events_before;
+        last_sanitize_log_time_ = sanitize_log_time_before;
+        RecordLocalDdsWriteFailure(
+            "damping", std::nullopt, call_attempt_time, local_return_time);
+      }
     }
 
     /**
-     * @brief Command-writer thread body (500 Hz).
+     * Write a phased command only if its first writer dispatch is still inside
+     * the 3 ms receipt-to-call boundary. The outcome distinguishes the SDK
+     * call-attempt timestamp from its local return timestamp; neither proves a
+     * later DDS transport or robot-side arrival, which this SDK does not expose.
+     */
+    [[nodiscard]] PhasedWriteOutcome WritePhasedMotorCommand(
+        const std::shared_ptr<const PhasedMotorCommand>& envelope) {
+      const auto q_targets_before_sanitize = last_sent_q_target_;
+      const bool had_q_targets_before_sanitize = has_last_sent_q_target_;
+      const uint64_t sanitize_events_before = sanitize_events_total_;
+      const auto sanitize_log_time_before = last_sanitize_log_time_;
+
+      LowCmd_ dds_low_command;
+      PopulateLowCommand(envelope->command, dds_low_command);
+      SanitizeLowCommand(dds_low_command);
+      dds_low_command.crc() =
+          Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
+
+      // Reject stale or malformed envelopes before sampling the final SDK-call
+      // boundary below.
+      auto fence_time = CommandFreshnessFenceT::Clock::now();
+      auto decision = command_freshness_fence_.Evaluate(envelope, fence_time);
+      if (!decision.IsAccepted()) {
+        // The candidate never reached local DDS, so it must not perturb the
+        // q-target slew reference used by the following damping or fresh write.
+        last_sent_q_target_ = q_targets_before_sanitize;
+        has_last_sent_q_target_ = had_q_targets_before_sanitize;
+        sanitize_events_total_ = sanitize_events_before;
+        last_sanitize_log_time_ = sanitize_log_time_before;
+        return {decision, fence_time};
+      }
+
+      // This exact timestamp is both the first-write fence boundary and the
+      // local SDK call-attempt timestamp. A host scheduler can still preempt
+      // before the SDK receives the call; no userspace branch can retract a
+      // write after that point.
+      const auto call_attempt_time = CommandFreshnessFenceT::Clock::now();
+      if (decision.IsFirstWrite() &&
+          !CommandFreshnessFenceT::IsFirstWritePhaseOnTime(
+              *envelope, call_attempt_time)) {
+        command_freshness_fence_.RejectAcceptedFirstWrite(
+            envelope->source_generation,
+            CommandFreshnessFenceT::Result::kFirstWritePhaseDeadlineMissed);
+        decision = {CommandFreshnessFenceT::Result::kFirstWritePhaseDeadlineMissed};
+        last_sent_q_target_ = q_targets_before_sanitize;
+        has_last_sent_q_target_ = had_q_targets_before_sanitize;
+        sanitize_events_total_ = sanitize_events_before;
+        last_sanitize_log_time_ = sanitize_log_time_before;
+        return {decision, call_attempt_time, call_attempt_time};
+      }
+
+      const bool local_write_succeeded = lowcmd_publisher_->Write(dds_low_command);
+      const auto local_return_time = CommandFreshnessFenceT::Clock::now();
+      if (!local_write_succeeded) {
+        RecordLocalDdsWriteFailure(
+            "phased", envelope->source_generation, call_attempt_time, local_return_time);
+        if (decision.IsFirstWrite()) {
+          command_freshness_fence_.RejectAcceptedFirstWrite(
+              envelope->source_generation,
+              CommandFreshnessFenceT::Result::kFirstWriteDispatchFailed);
+          decision = {CommandFreshnessFenceT::Result::kFirstWriteDispatchFailed};
+        }
+        // A failed local DDS call did not send the candidate, so leave the
+        // sanitizer state as it was before packing it.
+        last_sent_q_target_ = q_targets_before_sanitize;
+        has_last_sent_q_target_ = had_q_targets_before_sanitize;
+        sanitize_events_total_ = sanitize_events_before;
+        last_sanitize_log_time_ = sanitize_log_time_before;
+        return {decision, call_attempt_time, call_attempt_time, local_return_time, false};
+      }
+      if (decision.IsFirstWrite()) {
+        // Record after the successful publisher return so telemetry/logging
+        // cannot delay the bounded call attempt that it is measuring.
+        RecordFirstLocalDdsWrite(*envelope, call_attempt_time, local_return_time);
+      }
+      return {decision, call_attempt_time, call_attempt_time, local_return_time, true};
+    }
+
+    /**
+     * @brief Sole command-writer thread body (event wake + 500 Hz maintenance).
      *
-     * The writer evaluates the LowState receipt embedded in the command
-     * envelope on every tick. A missing, future, expired, or regressing
-     * command is replaced here with continuous known damping rather than
-     * replaying an old full-gain command.
+     * The writer evaluates complete LowState phase provenance at the actual
+     * source-side rt/lowcmd call boundary. A missing, late, malformed, stale,
+     * or regressing envelope is replaced here with continuous known damping.
      */
     void LowCommandWriter() {
       const std::shared_ptr<const PhasedMotorCommand> envelope =
           motor_command_buffer_.GetDataWithTime().data;
       const MotorCommand damping_command = MakeDampingCommand();
-      const auto decision = command_freshness_fence_.Evaluate(envelope);
-      if (decision.IsAccepted()) {
-        WriteMotorCommand(envelope->command);
-      } else {
+      if (!envelope) {
         WriteMotorCommand(damping_command);
+      } else {
+        const auto write_outcome = WritePhasedMotorCommand(envelope);
+        if (!write_outcome.decision.IsAccepted() ||
+            !write_outcome.local_write_succeeded) {
+          WriteMotorCommand(damping_command);
+          if (write_outcome.decision.result ==
+              CommandFreshnessFenceT::Result::kFirstWritePhaseDeadlineMissed) {
+            RecordPhaseDeadlineMiss(*envelope, write_outcome.fence_time);
+          }
+        }
       }
 
       // Publish Dex3 hand commands at the same publish cadence
@@ -2906,19 +3179,26 @@ class G1Deploy {
       operator_state.stop = true;
       low_state_phase_gate_.Stop();
 
-      if (control_thread_ptr_) {
+      if (input_thread_ptr_) {
         input_thread_ptr_->Wait();
         input_thread_ptr_.reset();
+      }
+      if (control_thread_ptr_) {
         control_thread_ptr_->Wait();
         control_thread_ptr_.reset();
-        command_writer_ptr_->Wait();
-        command_writer_ptr_.reset();
-        if (planner_thread_ptr_) {
-          planner_thread_ptr_->Wait();
-          planner_thread_ptr_.reset();
-        }
       }
+      if (planner_thread_ptr_) {
+        planner_thread_ptr_->Wait();
+        planner_thread_ptr_.reset();
+      }
+      // Producers are now quiescent. Clear and notify before terminally
+      // stopping/joining the sole writer; the final direct damping write is
+      // therefore never concurrent with a writer-thread DDS call.
       CreateDampingCommand();
+      command_writer_wake_.Stop();
+      if (command_writer_thread_.joinable()) {
+        command_writer_thread_.join();
+      }
       LowCommandWriter();
       std::cout << "Stop" << std::endl;
     }
@@ -2926,22 +3206,43 @@ class G1Deploy {
     /// Invalidate any full-gain lease so the writer emits its own damping command.
     void CreateDampingCommand() {
       motor_command_buffer_.Clear();
+      command_writer_wake_.Notify();
+    }
+
+    /// Consume exactly one previously unused LowState generation for a command.
+    [[nodiscard]] LowStatePhaseGateT::WaitOutcome WaitForNewCommandLowState(
+        LowStatePhaseGateT::Duration max_receipt_age,
+        LowStatePhaseGateT::Duration max_wait) {
+      const auto outcome = low_state_phase_gate_.WaitForNewLowState(
+          last_command_low_state_generation_, max_receipt_age, max_wait);
+      if (outcome.result == LowStatePhaseGateT::Result::kReady &&
+          outcome.snapshot.HasLowState()) {
+        // Advance before producing the envelope. If a later safety check drops
+        // this tick, retrying an old observation would be less safe than
+        // waiting for the next physical LowState receipt.
+        last_command_low_state_generation_ = outcome.snapshot.generation;
+      }
+      return outcome;
     }
 
     /// Publish a command together with the immutable LowState source phase.
     void PublishPhasedMotorCommand(MotorCommand motor_command,
                                    const LowStatePhaseGateT::Snapshot& phase_snapshot) {
+      const auto envelope_published_time = CommandFreshnessFenceT::Clock::now();
       motor_command_buffer_.SetData(PhasedMotorCommand{
           .command = std::move(motor_command),
           .source_low_state_receipt = phase_snapshot.receipt_time,
+          .gate_wake_time = phase_snapshot.gate_wake_time,
+          .envelope_published_time = envelope_published_time,
           .source_generation = phase_snapshot.generation,
       });
+      command_writer_wake_.Notify();
     }
 
     /// Renew the neutral default-pose lease while waiting for an operator start.
     bool PublishStandHoldLease() {
-      const auto phase_wait_outcome = low_state_phase_gate_.WaitForFreshLowState(
-          CommandFreshnessFenceT::kMaxCommandAge, std::chrono::milliseconds::zero());
+      const auto phase_wait_outcome = WaitForNewCommandLowState(
+          LOW_STATE_PHASE_MAX_AGE, LOW_STATE_PHASE_MAX_WAIT);
       if (phase_wait_outcome.result != LowStatePhaseGateT::Result::kReady ||
           !phase_wait_outcome.snapshot.HasLowState()) {
         return false;
@@ -2968,8 +3269,8 @@ class G1Deploy {
      * @return True once LowState data is available; false if not yet ready.
      */
     bool InitControl() {
-      const auto phase_wait_outcome = low_state_phase_gate_.WaitForFreshLowState(
-          CommandFreshnessFenceT::kMaxCommandAge, std::chrono::milliseconds::zero());
+      const auto phase_wait_outcome = WaitForNewCommandLowState(
+          LOW_STATE_PHASE_MAX_AGE, LOW_STATE_PHASE_MAX_WAIT);
       if (phase_wait_outcome.result != LowStatePhaseGateT::Result::kReady ||
           !phase_wait_outcome.snapshot.HasLowState()) {
         return false;
@@ -4206,7 +4507,7 @@ class G1Deploy {
           }
 
           const auto phase_wait_start_time = std::chrono::steady_clock::now();
-          const auto phase_wait_outcome = low_state_phase_gate_.WaitForFreshLowState(
+          const auto phase_wait_outcome = WaitForNewCommandLowState(
               LOW_STATE_PHASE_MAX_AGE, LOW_STATE_PHASE_MAX_WAIT);
           const auto phase_wait_duration = std::chrono::duration_cast<std::chrono::microseconds>(
               std::chrono::steady_clock::now() - phase_wait_start_time);
