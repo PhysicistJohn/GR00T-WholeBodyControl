@@ -395,6 +395,8 @@ class G1Deploy {
     double low_state_age_at_state_snapshot_ms_ = -1.0;
     std::uint64_t low_state_phase_timeout_count_ = 0;
     std::uint64_t low_state_phase_expired_before_consumption_count_ = 0;
+    RollingStats<50> low_state_to_command_phase_us_;
+    double low_state_to_command_phase_max_us_ = 0.0;
     std::optional<std::chrono::steady_clock::time_point> low_state_phase_loss_started_at_;
 
     // State logger
@@ -4335,6 +4337,14 @@ class G1Deploy {
             return;
           }
           auto motor_command_end_time = std::chrono::steady_clock::now();
+          const auto low_state_to_command_duration =
+              std::chrono::duration_cast<std::chrono::microseconds>(
+                  motor_command_end_time - phase_wait_outcome.snapshot.receipt_time);
+          const double low_state_to_command_us =
+              static_cast<double>(low_state_to_command_duration.count());
+          low_state_to_command_phase_us_.push(low_state_to_command_us);
+          low_state_to_command_phase_max_us_ =
+              std::max(low_state_to_command_phase_max_us_, low_state_to_command_us);
 
           // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
           dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
@@ -4439,6 +4449,13 @@ class G1Deploy {
             auto post_hand_joint_duration = std::chrono::duration_cast<std::chrono::microseconds>(control_loop_end_time - hand_joint_end_time);
             
             std::cout << "Loop timing - LowState age at snapshot: " << low_state_age_at_state_snapshot_ms_ << "ms"
+                      << ", LowState generation: " << phase_wait_outcome.snapshot.generation
+                      << ", LowState receipt to command mean: "
+                      << low_state_to_command_phase_us_.mean() << "us"
+                      << ", LowState receipt to command std: "
+                      << low_state_to_command_phase_us_.stddev() << "us"
+                      << ", LowState receipt to command max: "
+                      << low_state_to_command_phase_max_us_ << "us"
                       << ", Phase wait: " << phase_wait_duration.count() << "us"
                       << ", Phase timeouts: " << low_state_phase_timeout_count_
                       << ", Expired before consumption: "
@@ -4471,6 +4488,8 @@ class G1Deploy {
             std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
             
             std::cout << std::endl;
+            low_state_to_command_phase_us_.clear();
+            low_state_to_command_phase_max_us_ = 0.0;
           }
           break;
         }
