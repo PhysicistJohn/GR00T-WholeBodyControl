@@ -121,6 +121,7 @@ bool ShutdownSignalRequested() noexcept {
 #include "../include/event_periodic_wake.hpp"
 #include "../include/heading_reference_anchor.hpp"
 #include "../include/low_state_phase_gate.hpp"
+#include "../include/sanitizer_state_rollback.hpp"
 
 // Observation configuration
 #include "../include/observation_config.hpp"
@@ -3040,10 +3041,9 @@ class G1Deploy {
     /// The result is deliberately observed even though this path has no source
     /// generation that can be terminally fenced.
     void WriteMotorCommand(const MotorCommand& motor_command) {
-      const auto q_targets_before_sanitize = last_sent_q_target_;
-      const bool had_q_targets_before_sanitize = has_last_sent_q_target_;
-      const uint64_t sanitize_events_before = sanitize_events_total_;
-      const auto sanitize_log_time_before = last_sanitize_log_time_;
+      SanitizerStateRollback sanitizer_rollback(
+          last_sent_q_target_, has_last_sent_q_target_, sanitize_events_total_,
+          last_sanitize_log_time_);
 
       LowCmd_ dds_low_command;
       PopulateLowCommand(motor_command, dds_low_command);
@@ -3055,15 +3055,11 @@ class G1Deploy {
       const bool local_write_succeeded = lowcmd_publisher_->Write(dds_low_command);
       const auto local_return_time = CommandFreshnessFenceT::Clock::now();
       if (!local_write_succeeded) {
-        // A failed damping write published nothing. Restore every sanitizer
-        // field that describes the last successfully published q-target.
-        last_sent_q_target_ = q_targets_before_sanitize;
-        has_last_sent_q_target_ = had_q_targets_before_sanitize;
-        sanitize_events_total_ = sanitize_events_before;
-        last_sanitize_log_time_ = sanitize_log_time_before;
         RecordLocalDdsWriteFailure(
             "damping", std::nullopt, call_attempt_time, local_return_time);
+        return;
       }
+      sanitizer_rollback.Commit();
     }
 
     /**
@@ -3074,10 +3070,9 @@ class G1Deploy {
      */
     [[nodiscard]] PhasedWriteOutcome WritePhasedMotorCommand(
         const std::shared_ptr<const PhasedMotorCommand>& envelope) {
-      const auto q_targets_before_sanitize = last_sent_q_target_;
-      const bool had_q_targets_before_sanitize = has_last_sent_q_target_;
-      const uint64_t sanitize_events_before = sanitize_events_total_;
-      const auto sanitize_log_time_before = last_sanitize_log_time_;
+      SanitizerStateRollback sanitizer_rollback(
+          last_sent_q_target_, has_last_sent_q_target_, sanitize_events_total_,
+          last_sanitize_log_time_);
 
       LowCmd_ dds_low_command;
       PopulateLowCommand(envelope->command, dds_low_command);
@@ -3092,10 +3087,6 @@ class G1Deploy {
       if (!decision.IsAccepted()) {
         // The candidate never reached local DDS, so it must not perturb the
         // q-target slew reference used by the following damping or fresh write.
-        last_sent_q_target_ = q_targets_before_sanitize;
-        has_last_sent_q_target_ = had_q_targets_before_sanitize;
-        sanitize_events_total_ = sanitize_events_before;
-        last_sanitize_log_time_ = sanitize_log_time_before;
         return {decision, fence_time};
       }
 
@@ -3111,10 +3102,6 @@ class G1Deploy {
             envelope->source_generation,
             CommandFreshnessFenceT::Result::kFirstWritePhaseDeadlineMissed);
         decision = {CommandFreshnessFenceT::Result::kFirstWritePhaseDeadlineMissed};
-        last_sent_q_target_ = q_targets_before_sanitize;
-        has_last_sent_q_target_ = had_q_targets_before_sanitize;
-        sanitize_events_total_ = sanitize_events_before;
-        last_sanitize_log_time_ = sanitize_log_time_before;
         return {decision, call_attempt_time, call_attempt_time};
       }
 
@@ -3131,12 +3118,9 @@ class G1Deploy {
         }
         // A failed local DDS call did not send the candidate, so leave the
         // sanitizer state as it was before packing it.
-        last_sent_q_target_ = q_targets_before_sanitize;
-        has_last_sent_q_target_ = had_q_targets_before_sanitize;
-        sanitize_events_total_ = sanitize_events_before;
-        last_sanitize_log_time_ = sanitize_log_time_before;
         return {decision, call_attempt_time, call_attempt_time, local_return_time, false};
       }
+      sanitizer_rollback.Commit();
       if (decision.IsFirstWrite()) {
         // Record after the successful publisher return so telemetry/logging
         // cannot delay the bounded call attempt that it is measuring.
