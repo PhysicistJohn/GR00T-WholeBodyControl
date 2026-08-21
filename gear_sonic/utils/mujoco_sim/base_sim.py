@@ -71,6 +71,7 @@ try:
         SimBootstrapConfig,
         SimBootstrapController,
     )
+    from g1_mcp.simulation_plant_lease import SimulationPlantControlLease
     from robot_registry import DEFAULT_29
 except ImportError as exc:
     _bootstrap_import_error = exc
@@ -78,6 +79,7 @@ except ImportError as exc:
     JointBootstrapCommand = None
     SimBootstrapConfig = None
     SimBootstrapController = None
+    SimulationPlantControlLease = None
     DEFAULT_29 = None
 
 GEAR_SONIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -796,8 +798,18 @@ class DefaultEnv:
         self.init_scene()
         self.bootstrap_controller = None
         self._bootstrap_phase = None
+        # This is configured only on Simulation1. Its local plant ingress
+        # writes the file; the simulator merely consumes the bounded
+        # CLOCK_MONOTONIC lease when deciding whether a received LowCmd may
+        # remain external actuator authority.
+        self._simulation_plant_control_lease = None
+        self._simulation_plant_control_lease_reason = None
         if self.config.get("ENABLE_BOOTSTRAP_CONTROLLER", False):
-            if SimBootstrapController is None or DEFAULT_29 is None:
+            if (
+                SimBootstrapController is None
+                or SimulationPlantControlLease is None
+                or DEFAULT_29 is None
+            ):
                 raise RuntimeError(
                     "ENABLE_BOOTSTRAP_CONTROLLER requires unitree-g1-handsim/src "
                     f"and scripts on PYTHONPATH; import failed: {_bootstrap_import_error!r}"
@@ -820,6 +832,9 @@ class DefaultEnv:
             )
             self.bootstrap_controller = SimBootstrapController(
                 np.asarray(DEFAULT_29, dtype=float), bootstrap_config
+            )
+            self._simulation_plant_control_lease = (
+                SimulationPlantControlLease.from_environment()
             )
         self.last_reward = 0
 
@@ -1313,6 +1328,16 @@ class DefaultEnv:
         if self.bootstrap_controller is not None:
             snapshot = self.unitree_bridge.body_command_snapshot()
             external = None
+            lease_permits_external = True
+            if self._simulation_plant_control_lease is not None:
+                lease = self._simulation_plant_control_lease.decision()
+                lease_permits_external = lease.active
+                if lease.reason != self._simulation_plant_control_lease_reason:
+                    self._simulation_plant_control_lease_reason = lease.reason
+                    print(
+                        f"[base_sim] Simulation1 LowCmd lease -> {lease.reason}",
+                        flush=True,
+                    )
             max_age = float(os.environ.get("DROID_BOOT_EXTERNAL_MAX_AGE_SECONDS", "0.1"))
             min_kp = float(os.environ.get("DROID_BOOT_EXTERNAL_MIN_KP", "1.0"))
             min_active = int(os.environ.get("DROID_BOOT_EXTERNAL_MIN_ACTIVE_JOINTS", "12"))
@@ -1320,7 +1345,12 @@ class DefaultEnv:
                 snapshot is not None
                 and int(np.count_nonzero(snapshot["kp"] >= min_kp)) >= min_active
             )
-            if snapshot is not None and snapshot["age_s"] <= max_age and command_is_active:
+            if (
+                lease_permits_external
+                and snapshot is not None
+                and snapshot["age_s"] <= max_age
+                and command_is_active
+            ):
                 external = JointBootstrapCommand(
                     q=snapshot["q"],
                     dq=snapshot["dq"],
