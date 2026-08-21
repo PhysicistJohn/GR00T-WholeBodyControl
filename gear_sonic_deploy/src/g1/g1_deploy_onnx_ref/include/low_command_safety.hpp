@@ -14,7 +14,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <utility>
 
 namespace low_command_safety {
 
@@ -103,13 +102,39 @@ template <std::size_t Count>
   return true;
 }
 
+/// Complete canonical fallback fields. Keeping this construction separate
+/// from the DDS packing code makes the known damping shape testable at the
+/// real 29-joint width: measured/retained q, zero dq/tau/kp, and kd=8.
+template <std::size_t Count>
+struct CanonicalDampingFields {
+  std::array<float, Count> q_target {};
+  std::array<float, Count> dq_target {};
+  std::array<float, Count> tau_ff {};
+  std::array<float, Count> kp {};
+  std::array<float, Count> kd {};
+};
+
 template <std::size_t Count, typename ReadMeasuredQ>
-std::array<float, Count> MeasuredDampingTargets(ReadMeasuredQ&& read_measured_q) {
-  std::array<float, Count> targets {};
+CanonicalDampingFields<Count> BuildCanonicalDampingFields(
+    bool has_measured_state, ReadMeasuredQ&& read_measured_q,
+    std::chrono::steady_clock::time_point measured_time,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::steady_clock::duration max_age,
+    const std::array<float, Count>& previously_published,
+    bool has_previously_published) noexcept {
+  CanonicalDampingFields<Count> fields {};
   for (std::size_t i = 0; i < Count; ++i) {
-    targets[i] = static_cast<float>(std::forward<ReadMeasuredQ>(read_measured_q)(i));
+    fields.q_target[i] = has_measured_state
+        ? DampingTargetFromFreshMeasuredQ(
+              static_cast<float>(read_measured_q(i)), measured_time, now,
+              max_age, previously_published[i], has_previously_published)
+        : (has_previously_published ? previously_published[i] : 0.0F);
+    fields.dq_target[i] = 0.0F;
+    fields.tau_ff[i] = 0.0F;
+    fields.kp[i] = 0.0F;
+    fields.kd[i] = 8.0F;
   }
-  return targets;
+  return fields;
 }
 
 }  // namespace low_command_safety

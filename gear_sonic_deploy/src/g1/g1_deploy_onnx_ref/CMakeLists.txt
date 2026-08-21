@@ -236,6 +236,7 @@ set_target_properties(low_command_safety_test PROPERTIES
 add_executable(writer_telemetry_mailbox_test
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/writer_telemetry_mailbox_test.cpp)
 target_include_directories(writer_telemetry_mailbox_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/)
+target_link_libraries(writer_telemetry_mailbox_test PRIVATE Threads::Threads)
 set_target_properties(writer_telemetry_mailbox_test PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
   CXX_STANDARD 20

@@ -34,10 +34,15 @@ class LatestSnapshotMailbox {
 
   /// Sole-producer publication. The odd/even sequence makes the snapshot
   /// coherent without a mutex or allocation; readers never wait for a writer.
+  /// Payload stores must be release operations: if a reader observes even one
+  /// newer payload word while it still holds an older sequence value, that
+  /// acquire/release synchronization carries this preceding odd sequence
+  /// transition into the reader's final sequence load. Per-atomic coherence
+  /// then prevents that final load from accepting the old even snapshot.
   void Publish(const Payload& payload) noexcept {
     sequence_.fetch_add(1, std::memory_order_acq_rel);  // write in progress
     for (std::size_t i = 0; i < WordCount; ++i) {
-      payload_[i].store(payload[i], std::memory_order_relaxed);
+      payload_[i].store(payload[i], std::memory_order_release);
     }
     sequence_.fetch_add(1, std::memory_order_release);  // complete snapshot
   }
@@ -53,7 +58,10 @@ class LatestSnapshotMailbox {
     }
     Payload candidate {};
     for (std::size_t i = 0; i < WordCount; ++i) {
-      candidate[i] = payload_[i].load(std::memory_order_relaxed);
+      // Acquire pairs with each release payload store. Together with the
+      // sequence acquire loads, this rejects a mixed old/new observation on
+      // weakly ordered aarch64 instead of accepting a torn record.
+      candidate[i] = payload_[i].load(std::memory_order_acquire);
     }
     const std::uint64_t end = sequence_.load(std::memory_order_acquire);
     if (begin != end || (end & 1U) != 0U) {

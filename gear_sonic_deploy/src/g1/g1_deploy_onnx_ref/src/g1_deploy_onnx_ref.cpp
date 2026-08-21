@@ -3001,31 +3001,26 @@ class G1Deploy {
     [[nodiscard]] MotorCommand MakeDampingCommand(
         const TimestampedData<LowState_>& latest_low_state) const {
       MotorCommand motor_command_tmp;
-      std::array<float, G1_NUM_MOTOR> damping_q_targets = last_sent_q_target_;
-      if (latest_low_state.HasData()) {
-        const auto measured_motor_state = latest_low_state.data->motor_state();
-        const auto damping_reference_time = CommandFreshnessFenceT::Clock::now();
-        damping_q_targets = low_command_safety::MeasuredDampingTargets<G1_NUM_MOTOR>(
-            [this, &latest_low_state, &measured_motor_state,
-             damping_reference_time](std::size_t index) {
-              return low_command_safety::DampingTargetFromFreshMeasuredQ(
-                  measured_motor_state[index].q(), latest_low_state.timestamp,
-                  damping_reference_time, LOW_STATE_DAMPING_REFERENCE_MAX_AGE,
-                  last_sent_q_target_[index], has_last_sent_q_target_);
-            });
-      } else if (!has_last_sent_q_target_) {
-        damping_q_targets.fill(0.0F);
-      }
+      const auto damping_reference_time = CommandFreshnessFenceT::Clock::now();
+      const auto damping_fields =
+          low_command_safety::BuildCanonicalDampingFields<G1_NUM_MOTOR>(
+              latest_low_state.HasData(),
+              [&latest_low_state](std::size_t index) {
+                return latest_low_state.data->motor_state()[index].q();
+              },
+              latest_low_state.timestamp, damping_reference_time,
+              LOW_STATE_DAMPING_REFERENCE_MAX_AGE, last_sent_q_target_,
+              has_last_sent_q_target_);
       for (int i = 0; i < G1_NUM_MOTOR; ++i) {
-        motor_command_tmp.tau_ff.at(i) = 0.0;
+        motor_command_tmp.tau_ff.at(i) = damping_fields.tau_ff.at(i);
         // Kp is zero for a damping command, so this is not positional control.
         // A fresh measured q prevents a valid fallback write from rebasing the
         // sanitizer's slew reference to zero; stale/invalid state retains the
         // last successfully published reference instead.
-        motor_command_tmp.q_target.at(i) = damping_q_targets.at(i);
-        motor_command_tmp.dq_target.at(i) = 0.0;
-        motor_command_tmp.kp.at(i) = 0;
-        motor_command_tmp.kd.at(i) = 8;
+        motor_command_tmp.q_target.at(i) = damping_fields.q_target.at(i);
+        motor_command_tmp.dq_target.at(i) = damping_fields.dq_target.at(i);
+        motor_command_tmp.kp.at(i) = damping_fields.kp.at(i);
+        motor_command_tmp.kd.at(i) = damping_fields.kd.at(i);
       }
       return motor_command_tmp;
     }

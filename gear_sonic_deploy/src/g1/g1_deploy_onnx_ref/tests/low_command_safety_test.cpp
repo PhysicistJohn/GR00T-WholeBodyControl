@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "policy_parameters.hpp"
+#include "robot_parameters.hpp"
 
 #include <array>
 #include <chrono>
@@ -33,19 +34,84 @@ bool NearlyEqual(float lhs, float rhs, float tolerance = 1.0e-6F) {
 }
 
 struct TestActuatorCommand {
-  std::array<float, 3> tau_ff {};
-  std::array<float, 3> q_target {};
-  std::array<float, 3> dq_target {};
-  std::array<float, 3> kp {};
-  std::array<float, 3> kd {};
+  std::array<float, G1_NUM_MOTOR> tau_ff {};
+  std::array<float, G1_NUM_MOTOR> q_target {};
+  std::array<float, G1_NUM_MOTOR> dq_target {};
+  std::array<float, G1_NUM_MOTOR> kp {};
+  std::array<float, G1_NUM_MOTOR> kd {};
 };
 
-void TestDampingTargetsFollowMeasuredPositions() {
-  constexpr std::array<float, 4> measured {-0.312F, 0.669F, -0.363F, 0.2F};
-  const auto targets = low_command_safety::MeasuredDampingTargets<measured.size()>(
-      [&measured](std::size_t index) { return measured[index]; });
-  Expect(targets == measured,
-         "damping q targets must use the current measured joint positions");
+void TestCanonicalDampingFieldsCoverEveryG1Joint() {
+  using namespace std::chrono_literals;
+  using Clock = std::chrono::steady_clock;
+  std::array<float, G1_NUM_MOTOR> measured {};
+  std::array<float, G1_NUM_MOTOR> previously_published {};
+  for (std::size_t i = 0; i < measured.size(); ++i) {
+    measured[i] = -0.312F + 0.021F * static_cast<float>(i);
+    previously_published[i] = 0.60F - 0.013F * static_cast<float>(i);
+  }
+
+  const auto now = Clock::time_point {100ms};
+  const auto damping = low_command_safety::BuildCanonicalDampingFields<G1_NUM_MOTOR>(
+      /*has_measured_state=*/true,
+      [&measured](std::size_t index) { return measured[index]; }, now - 1ms,
+      now, 10ms, previously_published, /*has_previously_published=*/true);
+  for (std::size_t i = 0; i < measured.size(); ++i) {
+    Expect(NearlyEqual(damping.q_target[i], measured[i]),
+           "every fresh measured joint position must become the damping q target");
+    Expect(NearlyEqual(damping.dq_target[i], 0.0F),
+           "canonical damping must zero every velocity target");
+    Expect(NearlyEqual(damping.tau_ff[i], 0.0F),
+           "canonical damping must zero every feedforward torque");
+    Expect(NearlyEqual(damping.kp[i], 0.0F),
+           "canonical damping must zero every proportional gain");
+    Expect(NearlyEqual(damping.kd[i], 8.0F),
+           "canonical damping must set every derivative gain to eight");
+  }
+  Expect(low_command_safety::HasOnlyFiniteActuatorFields(
+             damping.q_target, damping.dq_target, damping.tau_ff, damping.kp,
+             damping.kd),
+         "the 29-joint canonical damping command must be fully finite");
+}
+
+void TestCanonicalDampingRetainsEveryLastSafeReferenceWhenUnavailable() {
+  using namespace std::chrono_literals;
+  using Clock = std::chrono::steady_clock;
+  std::array<float, G1_NUM_MOTOR> previously_published {};
+  for (std::size_t i = 0; i < previously_published.size(); ++i) {
+    previously_published[i] = -0.53F + 0.019F * static_cast<float>(i);
+  }
+
+  const auto now = Clock::time_point {100ms};
+  const auto unavailable =
+      low_command_safety::BuildCanonicalDampingFields<G1_NUM_MOTOR>(
+          /*has_measured_state=*/false,
+          [](std::size_t) { return std::numeric_limits<float>::quiet_NaN(); },
+          now, now, 10ms, previously_published,
+          /*has_previously_published=*/true);
+  const auto stale = low_command_safety::BuildCanonicalDampingFields<G1_NUM_MOTOR>(
+      /*has_measured_state=*/true,
+      [](std::size_t) { return 42.0F; }, now - 10ms - 1us, now, 10ms,
+      previously_published, /*has_previously_published=*/true);
+  const auto invalid =
+      low_command_safety::BuildCanonicalDampingFields<G1_NUM_MOTOR>(
+          /*has_measured_state=*/true,
+          [](std::size_t) { return std::numeric_limits<float>::quiet_NaN(); },
+          now - 1ms, now, 10ms, previously_published,
+          /*has_previously_published=*/true);
+  for (std::size_t i = 0; i < previously_published.size(); ++i) {
+    Expect(NearlyEqual(unavailable.q_target[i], previously_published[i]),
+           "a missing LowState must retain every last safe q target");
+    Expect(NearlyEqual(stale.q_target[i], previously_published[i]),
+           "a stale LowState must retain every last safe q target");
+    Expect(NearlyEqual(invalid.q_target[i], previously_published[i]),
+           "an invalid LowState q must retain every last safe q target");
+    Expect(NearlyEqual(unavailable.dq_target[i], 0.0F) &&
+               NearlyEqual(unavailable.tau_ff[i], 0.0F) &&
+               NearlyEqual(unavailable.kp[i], 0.0F) &&
+               NearlyEqual(unavailable.kd[i], 8.0F),
+           "unavailable-state damping must retain the canonical kd-only fields");
+  }
 }
 
 void TestSlewLimitUsesWriterCadence() {
@@ -132,9 +198,17 @@ void TestLateGenerationFallsBackToFreshMeasuredDampingThenRecovers() {
   using namespace std::chrono_literals;
   using Fence = CommandFreshnessFence<TestActuatorCommand>;
 
-  constexpr std::array<float, 3> last_full_gain_targets {0.60F, -0.60F, 0.75F};
-  constexpr std::array<float, 3> fresh_measured_q {-0.31F, 0.42F, -0.18F};
-  constexpr std::array<float, 3> recovered_policy_q {0.70F, -0.50F, 0.65F};
+  std::array<float, G1_NUM_MOTOR> last_full_gain_targets {};
+  std::array<float, G1_NUM_MOTOR> fresh_measured_q {};
+  std::array<float, G1_NUM_MOTOR> recovered_policy_q {};
+  for (std::size_t i = 0; i < last_full_gain_targets.size(); ++i) {
+    last_full_gain_targets[i] = (i % 2 == 0 ? 0.60F : -0.60F) +
+        0.005F * static_cast<float>(i);
+    fresh_measured_q[i] = (i % 2 == 0 ? -0.31F : 0.42F) -
+        0.003F * static_cast<float>(i);
+    recovered_policy_q[i] = (i % 2 == 0 ? 0.70F : -0.50F) +
+        0.002F * static_cast<float>(i);
+  }
   constexpr auto kWriterPeriod = 2ms;
   // Exercise the writer-stall cap explicitly: recovery arrives 7 ms after
   // the successful damping write, but it may use no more than one 2 ms step.
@@ -145,8 +219,8 @@ void TestLateGenerationFallsBackToFreshMeasuredDampingThenRecovers() {
   Fence fence;
   TestActuatorCommand late_command;
   late_command.q_target = last_full_gain_targets;
-  late_command.kp = {12.0F, 12.0F, 12.0F};
-  late_command.kd = {1.0F, 1.0F, 1.0F};
+  late_command.kp.fill(12.0F);
+  late_command.kd.fill(1.0F);
   const auto late_receipt = damping_time - Fence::kMaxFirstWritePhase - 1us;
   const auto late_envelope = std::make_shared<const Fence::Envelope>(
       Fence::Envelope{
@@ -163,26 +237,14 @@ void TestLateGenerationFallsBackToFreshMeasuredDampingThenRecovers() {
              Fence::Result::kFirstWritePhaseDeadlineMissed,
          "a late generation must remain terminally fenced on writer replay");
 
-  // Model MakeDampingCommand followed by the canonical kd-only sanitizer
-  // path. The fresh measured reference must replace the old policy target,
-  // even when that replacement is larger than a full-gain slew step.
-  TestActuatorCommand damping;
-  const float one_packet_step = low_command_safety::SlewStepForElapsedTime(
-      Q_TARGET_SLEW_LIMIT, kWriterPeriod, kWriterPeriod);
+  // This is the same dependency-free field constructor used directly by
+  // MakeDampingCommand. It must cover all G1 joints, not a small model.
+  const auto damping = low_command_safety::BuildCanonicalDampingFields<G1_NUM_MOTOR>(
+      /*has_measured_state=*/true,
+      [&fresh_measured_q](std::size_t index) { return fresh_measured_q[index]; },
+      damping_time - 1ms, damping_time, kDampingReferenceMaxAge,
+      last_full_gain_targets, /*has_previously_published=*/true);
   for (std::size_t i = 0; i < damping.q_target.size(); ++i) {
-    const float measured_target = low_command_safety::DampingTargetFromFreshMeasuredQ(
-        fresh_measured_q[i], damping_time - 1ms, damping_time,
-        kDampingReferenceMaxAge, last_full_gain_targets[i],
-        /*has_previously_published=*/true);
-    damping.q_target[i] = low_command_safety::ApplyTargetSlew(
-        measured_target, last_full_gain_targets[i],
-        /*has_previously_published=*/true, one_packet_step,
-        /*enforce_slew_limit=*/false);
-    damping.tau_ff[i] = 0.0F;
-    damping.dq_target[i] = 0.0F;
-    damping.kp[i] = 0.0F;
-    damping.kd[i] = 8.0F;
-
     Expect(NearlyEqual(damping.q_target[i], fresh_measured_q[i]),
            "fresh measured q must be the canonical damping reference");
     Expect(NearlyEqual(damping.tau_ff[i], 0.0F),
@@ -198,7 +260,8 @@ void TestLateGenerationFallsBackToFreshMeasuredDampingThenRecovers() {
              damping.q_target, damping.dq_target, damping.tau_ff, damping.kp,
              damping.kd),
          "canonical damping fields must all be finite");
-  const std::array<float, 3> last_successfully_published_q = damping.q_target;
+  const std::array<float, G1_NUM_MOTOR> last_successfully_published_q =
+      damping.q_target;
 
   // A new, in-phase policy envelope may recover after that successful local
   // damping write. Its full-gain q targets must ramp from the measured
@@ -206,8 +269,8 @@ void TestLateGenerationFallsBackToFreshMeasuredDampingThenRecovers() {
   const auto recovery_time = damping_time + kRecoveryDt;
   TestActuatorCommand recovery_command;
   recovery_command.q_target = recovered_policy_q;
-  recovery_command.kp = {12.0F, 12.0F, 12.0F};
-  recovery_command.kd = {1.0F, 1.0F, 1.0F};
+  recovery_command.kp.fill(12.0F);
+  recovery_command.kd.fill(1.0F);
   const auto recovered_envelope = std::make_shared<const Fence::Envelope>(
       Fence::Envelope{
           .command = recovery_command,
@@ -321,7 +384,8 @@ void TestEveryPhasedActuatorFieldMustBeFinite() {
 }  // namespace
 
 int main() {
-  TestDampingTargetsFollowMeasuredPositions();
+  TestCanonicalDampingFieldsCoverEveryG1Joint();
+  TestCanonicalDampingRetainsEveryLastSafeReferenceWhenUnavailable();
   TestSlewLimitUsesWriterCadence();
   TestEventWakesCannotBorrowAFullWriterStep();
   TestWriterStallCannotAccumulateARecoveryJump();
