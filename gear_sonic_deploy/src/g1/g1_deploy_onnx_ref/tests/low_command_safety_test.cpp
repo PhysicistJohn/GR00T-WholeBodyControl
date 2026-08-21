@@ -102,7 +102,7 @@ void TestCanonicalDampingRetainsEveryLastSafeReferenceWhenUnavailable() {
           /*has_measured_state=*/true,
           [](std::size_t) { return std::numeric_limits<float>::quiet_NaN(); },
           now - 1ms, now, 10ms, previously_published,
-      /*has_previously_published=*/true);
+          /*has_previously_published=*/true);
   Expect(unavailable_reader_calls == 0,
          "a missing LowState must not dereference a measurement reader");
   for (std::size_t i = 0; i < previously_published.size(); ++i) {
