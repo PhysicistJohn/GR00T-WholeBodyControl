@@ -58,6 +58,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <array>
+#include <cstdint>
 #include <vector>
 #include <algorithm>
 #include <chrono>
@@ -120,8 +121,10 @@ bool ShutdownSignalRequested() noexcept {
 #include "../include/command_freshness_fence.hpp"
 #include "../include/event_periodic_wake.hpp"
 #include "../include/heading_reference_anchor.hpp"
+#include "../include/low_command_safety.hpp"
 #include "../include/low_state_phase_gate.hpp"
 #include "../include/sanitizer_state_rollback.hpp"
+#include "../include/writer_telemetry_mailbox.hpp"
 
 // Observation configuration
 #include "../include/observation_config.hpp"
@@ -218,6 +221,49 @@ class G1Deploy {
     };
     enum class LowStatePhaseSkipReason { kTimeout, kExpiredBeforeConsumption };
     enum class GatherRobotStateResult { kReady, kLowStateExpired, kInvalidState };
+    // Only the canonical kd-only damping path may bypass q-target slew. All
+    // full-gain envelopes stay bounded relative to the last local DDS write.
+    enum class QTargetSlewMode { kFullGainCommand, kCanonicalKdOnlyDamping };
+    enum class LowCommandKind { kDamping, kPhased };
+    struct SanitizationResult {
+      int events = 0;
+    };
+    static_assert(std::atomic<std::uint32_t>::is_always_lock_free,
+                  "mode-machine handoff must use a lock-free atomic");
+    enum FirstWritePhaseTelemetryWord : std::size_t {
+      kPhaseSamples,
+      kReceiptToGateWakeMeanUs,
+      kReceiptToGateWakeMaxUs,
+      kGateWakeToEnvelopeMeanUs,
+      kGateWakeToEnvelopeMaxUs,
+      kEnvelopeToCallAttemptMeanUs,
+      kEnvelopeToCallAttemptMaxUs,
+      kReceiptToCallAttemptMeanUs,
+      kReceiptToCallAttemptMaxUs,
+      kReceiptToLocalReturnMeanUs,
+      kReceiptToLocalReturnMaxUs,
+      kFirstWritePhaseTelemetryWordCount,
+    };
+    enum DeadlineMissTelemetryWord : std::size_t {
+      kDeadlineMissCount,
+      kDeadlineMissGeneration,
+      kDeadlineMissReceiptToFenceUs,
+      kDeadlineMissTelemetryWordCount,
+    };
+    enum LocalDdsFailureTelemetryWord : std::size_t {
+      kLocalDdsFailureCount,
+      kLocalDdsFailureIsDamping,
+      kLocalDdsFailureHasGeneration,
+      kLocalDdsFailureGeneration,
+      kLocalDdsFailureCallDurationUs,
+      kLocalDdsFailureTelemetryWordCount,
+    };
+    using FirstWritePhaseTelemetryMailbox =
+        writer_telemetry::LatestSnapshotMailbox<kFirstWritePhaseTelemetryWordCount>;
+    using DeadlineMissTelemetryMailbox =
+        writer_telemetry::LatestSnapshotMailbox<kDeadlineMissTelemetryWordCount>;
+    using LocalDdsFailureTelemetryMailbox =
+        writer_telemetry::LatestSnapshotMailbox<kLocalDdsFailureTelemetryWordCount>;
     
     // =========================================================================
     // Core timing, mode, and counters
@@ -230,7 +276,10 @@ class G1Deploy {
     double duration_;      ///< Duration of the INIT ramp-up to default pose (3 s).
     int counter_;          ///< General-purpose tick counter.
     Mode mode_pr_;         ///< Ankle control mode (series PR vs. parallel AB).
-    uint8_t mode_machine_; ///< Robot variant code received from LowState.
+    // Written by the DDS callback and read by the sole command writer. Use a
+    // naturally lock-free 32-bit handoff rather than a potentially locked
+    // byte atomic; the wire field is explicitly narrowed at packing time.
+    std::atomic<std::uint32_t> mode_machine_;
     
     // =========================================================================
     // Input interface and buffered input data
@@ -310,8 +359,12 @@ class G1Deploy {
     // published, for slew-rate limiting across writer ticks.
     std::array<float, G1_NUM_MOTOR> last_sent_q_target_{};
     bool has_last_sent_q_target_ = false;
-    uint64_t sanitize_events_total_ = 0;
-    std::chrono::steady_clock::time_point last_sanitize_log_time_{};
+    std::chrono::steady_clock::time_point last_sent_q_target_time_{};
+    // Only successful local DDS writes contribute to this count. The input
+    // worker, not the writer, emits its rate-limited telemetry.
+    std::atomic<std::uint64_t> sanitize_events_total_{0};
+    std::uint64_t last_reported_sanitize_events_total_ = 0;
+    std::chrono::steady_clock::time_point last_sanitize_telemetry_time_{};
 
     bool reinitialize_heading_ = true;
     bool report_temperature_ = false;
@@ -376,6 +429,11 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
     static constexpr std::chrono::milliseconds LOW_STATE_PHASE_MAX_AGE{1};
     static constexpr std::chrono::milliseconds LOW_STATE_PHASE_MAX_WAIT{10};
+    // The slowest supported LowState source is the 200 Hz simulator. Two of
+    // those 5 ms periods are allowed for a damping reference; beyond 10 ms we
+    // retain the last successfully published target rather than rebase to a
+    // stale measured pose. Hardware's 500 Hz state stream is well inside it.
+    static constexpr std::chrono::milliseconds LOW_STATE_DAMPING_REFERENCE_MAX_AGE{10};
     ProgramState program_state_;
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
@@ -435,7 +493,15 @@ class G1Deploy {
     std::uint64_t first_local_dds_phase_sample_count_ = 0;
     std::uint64_t first_local_dds_phase_deadline_miss_count_ = 0;
     std::uint64_t local_dds_write_failure_count_ = 0;
-    std::chrono::steady_clock::time_point last_local_dds_write_failure_log_time_{};
+    // Writer-to-input telemetry handoffs: the writer only stores lock-free
+    // numeric snapshots; Input performs all formatting and stdout I/O.
+    FirstWritePhaseTelemetryMailbox first_write_phase_telemetry_mailbox_;
+    DeadlineMissTelemetryMailbox deadline_miss_telemetry_mailbox_;
+    LocalDdsFailureTelemetryMailbox local_dds_failure_telemetry_mailbox_;
+    std::uint64_t observed_first_write_phase_telemetry_sequence_ = 0;
+    std::uint64_t observed_deadline_miss_telemetry_sequence_ = 0;
+    std::uint64_t observed_local_dds_failure_telemetry_sequence_ = 0;
+    std::chrono::steady_clock::time_point last_local_dds_failure_telemetry_time_{};
     std::optional<std::chrono::steady_clock::time_point> low_state_phase_loss_started_at_;
 
     // State logger
@@ -2820,9 +2886,14 @@ class G1Deploy {
       low_state_buffer_.SetData(low_state);
 
       // update mode machine
-      if (mode_machine_ != low_state.mode_machine()) {
-        if (mode_machine_ == 0) std::cout << "G1 type: " << unsigned(low_state.mode_machine()) << std::endl;
-        mode_machine_ = low_state.mode_machine();
+      const auto received_mode_machine =
+          static_cast<std::uint32_t>(low_state.mode_machine());
+      const auto previous_mode_machine = mode_machine_.exchange(
+          received_mode_machine, std::memory_order_relaxed);
+      if (previous_mode_machine != received_mode_machine) {
+        if (previous_mode_machine == 0) {
+          std::cout << "G1 type: " << received_mode_machine << std::endl;
+        }
       }
       low_state_phase_gate_.NotifyLowState(low_state, receipt_time);
     }
@@ -2840,66 +2911,118 @@ class G1Deploy {
      * damping) placed in the buffer: clamps q_target to the MJCF joint limits,
      * slew-limits q_target to Q_TARGET_SLEW_LIMIT so a discontinuous target
      * becomes a bounded ramp instead of a full-stiffness PD step, and clamps
-     * tau feedforward to the motor effort ceiling. Clamp events are counted
-     * and logged at most once per second. Must never bind in nominal motion.
+     * tau feedforward to the motor effort ceiling. It performs no I/O and
+     * returns its event accounting to the caller, which records it only after
+     * a successful local DDS return. Must never bind in nominal motion.
      */
-    void SanitizeLowCommand(LowCmd_& cmd) {
+    [[nodiscard]] SanitizationResult SanitizeLowCommand(
+        LowCmd_& cmd,
+        std::chrono::steady_clock::time_point sanitize_time,
+        QTargetSlewMode q_target_slew_mode) {
       int events = 0;
-      int last_joint = -1;
-      const char* last_kind = "";
-      float last_delta = 0.0f;
-      // Targets update at the 50 Hz control tick but are re-sent at the 500 Hz
-      // writer, so a smooth 35 rad/s trajectory legitimately arrives as one
-      // control_dt-sized step between otherwise-identical writer ticks. Budget
-      // per writer tick = one control period of Q_TARGET_SLEW_LIMIT motion;
-      // nominal gait steps (~0.1-0.3 rad) pass, NaN/unit-error jumps (rad+) don't.
-      const float max_q_step = Q_TARGET_SLEW_LIMIT * static_cast<float>(control_dt_);
+      const bool enforce_q_target_slew =
+          q_target_slew_mode == QTargetSlewMode::kFullGainCommand;
+      // Event wakes can occur sooner than the 500 Hz maintenance cadence. Use
+      // elapsed time since the last successful local DDS write, capped at one
+      // writer period, so bunched wakes cannot borrow a full 2 ms allowance
+      // and a long stall cannot create a large recovery packet.
+      const auto elapsed_since_last_successful_write = has_last_sent_q_target_
+          ? sanitize_time - last_sent_q_target_time_
+          : std::chrono::steady_clock::duration::zero();
+      const auto max_writer_period = std::chrono::duration_cast<
+          std::chrono::steady_clock::duration>(std::chrono::duration<double>(publish_dt_));
+      const float max_q_step = low_command_safety::SlewStepForElapsedTime(
+          Q_TARGET_SLEW_LIMIT, elapsed_since_last_successful_write,
+          max_writer_period);
       for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
         auto& m = cmd.motor_cmd().at(i);
         float q = m.q();
         const float q_limited = std::min(std::max(q, q_lower_limits[i] - Q_SANITIZE_MARGIN),
                                          q_upper_limits[i] + Q_SANITIZE_MARGIN);
         if (q_limited != q) {
-          events++; last_joint = i; last_kind = "qlim"; last_delta = q - q_limited;
+          ++events;
           q = q_limited;
         }
-        if (has_last_sent_q_target_) {
-          const float step = q - last_sent_q_target_[i];
-          if (step > max_q_step) {
-            events++; last_joint = i; last_kind = "slew"; last_delta = step;
-            q = last_sent_q_target_[i] + max_q_step;
-          } else if (step < -max_q_step) {
-            events++; last_joint = i; last_kind = "slew"; last_delta = step;
-            q = last_sent_q_target_[i] - max_q_step;
-          }
+        // Damping is kd-only (kp=0), so q has no positional-control effect.
+        // Its target must become the measured reference after a successful
+        // fallback write; full-gain policy commands remain slew-limited.
+        const float q_slew_limited = low_command_safety::ApplyTargetSlew(
+            q, last_sent_q_target_[i], has_last_sent_q_target_, max_q_step,
+            enforce_q_target_slew);
+        if (q_slew_limited != q) {
+          ++events;
+          q = q_slew_limited;
         }
         m.q() = q;
         last_sent_q_target_[i] = q;
         const float tau = m.tau();
         const float tau_limited = std::min(std::max(tau, -tau_ff_limits[i]), tau_ff_limits[i]);
         if (tau_limited != tau) {
-          events++; last_joint = i; last_kind = "tau"; last_delta = tau - tau_limited;
+          ++events;
           m.tau() = tau_limited;
         }
       }
       has_last_sent_q_target_ = true;
-      if (events > 0) {
-        sanitize_events_total_ += events;
-        const auto now = std::chrono::steady_clock::now();
-        if (now - last_sanitize_log_time_ > std::chrono::seconds(1)) {
-          std::cout << "[SANITIZE] clamped " << events << " field(s) this tick, last: joint "
-                    << last_joint << " " << last_kind << " excess " << last_delta
-                    << " (" << sanitize_events_total_ << " total)" << std::endl;
-          last_sanitize_log_time_ = now;
-        }
+      return {events};
+    }
+
+    /// Account only for sanitizer work on a command that really returned from
+    /// the local DDS writer. This intentionally performs no writer-thread I/O.
+    void RecordSanitizationAfterSuccessfulWrite(
+        const SanitizationResult& sanitization) noexcept {
+      if (sanitization.events > 0) {
+        sanitize_events_total_.fetch_add(
+            static_cast<std::uint64_t>(sanitization.events),
+            std::memory_order_relaxed);
       }
     }
 
-    [[nodiscard]] MotorCommand MakeDampingCommand() const {
+    /// Emit sanitizer telemetry from the 100 Hz input worker, never from the
+    /// pre-fence or post-DDS command-writer path.
+    void EmitSanitizerTelemetryFromInputThread() {
+      const std::uint64_t total =
+          sanitize_events_total_.load(std::memory_order_relaxed);
+      if (total == last_reported_sanitize_events_total_) {
+        return;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (last_sanitize_telemetry_time_ != std::chrono::steady_clock::time_point{} &&
+          now - last_sanitize_telemetry_time_ < std::chrono::seconds(1)) {
+        return;
+      }
+      std::cout << "[SANITIZE] clamped "
+                << total - last_reported_sanitize_events_total_
+                << " field(s) since the prior report (" << total << " total)"
+                << std::endl;
+      last_reported_sanitize_events_total_ = total;
+      last_sanitize_telemetry_time_ = now;
+    }
+
+    [[nodiscard]] MotorCommand MakeDampingCommand(
+        const TimestampedData<LowState_>& latest_low_state) const {
       MotorCommand motor_command_tmp;
+      std::array<float, G1_NUM_MOTOR> damping_q_targets = last_sent_q_target_;
+      if (latest_low_state.HasData()) {
+        const auto measured_motor_state = latest_low_state.data->motor_state();
+        const auto damping_reference_time = CommandFreshnessFenceT::Clock::now();
+        damping_q_targets = low_command_safety::MeasuredDampingTargets<G1_NUM_MOTOR>(
+            [this, &latest_low_state, &measured_motor_state,
+             damping_reference_time](std::size_t index) {
+              return low_command_safety::DampingTargetFromFreshMeasuredQ(
+                  measured_motor_state[index].q(), latest_low_state.timestamp,
+                  damping_reference_time, LOW_STATE_DAMPING_REFERENCE_MAX_AGE,
+                  last_sent_q_target_[index], has_last_sent_q_target_);
+            });
+      } else if (!has_last_sent_q_target_) {
+        damping_q_targets.fill(0.0F);
+      }
       for (int i = 0; i < G1_NUM_MOTOR; ++i) {
         motor_command_tmp.tau_ff.at(i) = 0.0;
-        motor_command_tmp.q_target.at(i) = 0.0;
+        // Kp is zero for a damping command, so this is not positional control.
+        // A fresh measured q prevents a valid fallback write from rebasing the
+        // sanitizer's slew reference to zero; stale/invalid state retains the
+        // last successfully published reference instead.
+        motor_command_tmp.q_target.at(i) = damping_q_targets.at(i);
         motor_command_tmp.dq_target.at(i) = 0.0;
         motor_command_tmp.kp.at(i) = 0;
         motor_command_tmp.kd.at(i) = 8;
@@ -2907,10 +3030,45 @@ class G1Deploy {
       return motor_command_tmp;
     }
 
+    /// Publish damping using the freshest safe q-target reference available.
+    /// This is intentionally outside WritePhasedMotorCommand(): the successful
+    /// first-write path must retain its tight 3 ms receipt-to-call budget.
+    void WriteDampingCommand() {
+      const TimestampedData<LowState_> latest_low_state =
+          low_state_buffer_.GetDataWithTime();
+      const MotorCommand motor_command = MakeDampingCommand(latest_low_state);
+      SanitizerStateRollback sanitizer_rollback(
+          last_sent_q_target_, has_last_sent_q_target_, last_sent_q_target_time_);
+
+      LowCmd_ dds_low_command;
+      PopulateLowCommand(motor_command, dds_low_command);
+
+      const auto sanitize_time = CommandFreshnessFenceT::Clock::now();
+      const SanitizationResult sanitization = SanitizeLowCommand(
+          dds_low_command, sanitize_time,
+          QTargetSlewMode::kCanonicalKdOnlyDamping);
+
+      dds_low_command.crc() =
+          Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
+      const auto call_attempt_time = CommandFreshnessFenceT::Clock::now();
+      const bool local_write_succeeded = lowcmd_publisher_->Write(dds_low_command);
+      const auto local_return_time = CommandFreshnessFenceT::Clock::now();
+      if (!local_write_succeeded) {
+        RecordLocalDdsWriteFailure(
+            LowCommandKind::kDamping, std::nullopt,
+            call_attempt_time, local_return_time);
+        return;
+      }
+      last_sent_q_target_time_ = local_return_time;
+      sanitizer_rollback.Commit();
+      RecordSanitizationAfterSuccessfulWrite(sanitization);
+    }
+
     /// Populate a DDS low command without publishing it.
     void PopulateLowCommand(const MotorCommand& motor_command, LowCmd_& dds_low_command) const {
-      dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
-      dds_low_command.mode_machine() = mode_machine_;
+      dds_low_command.mode_pr() = static_cast<std::uint8_t>(mode_pr_);
+      dds_low_command.mode_machine() = static_cast<std::uint8_t>(
+          mode_machine_.load(std::memory_order_relaxed));
 
       for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
         dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
@@ -2960,29 +3118,25 @@ class G1Deploy {
       if (++first_local_dds_phase_sample_count_ < 50) {
         return;
       }
-      std::cout << "[SONIC_PHASE] samples=" << first_local_dds_phase_sample_count_
-                << " receipt_to_gate_wake_us_mean=" << low_state_to_gate_wake_phase_us_.mean()
-                << " receipt_to_gate_wake_us_max=" << low_state_to_gate_wake_phase_max_us_
-                << " gate_wake_to_envelope_us_mean=" << gate_wake_to_envelope_phase_us_.mean()
-                << " gate_wake_to_envelope_us_max=" << gate_wake_to_envelope_phase_max_us_
-                << " envelope_to_first_local_dds_call_attempt_us_mean="
-                << envelope_to_first_local_call_attempt_phase_us_.mean()
-                << " envelope_to_first_local_dds_call_attempt_us_max="
-                << envelope_to_first_local_call_attempt_phase_max_us_
-                << " receipt_to_first_local_dds_call_attempt_us_mean="
-                << low_state_to_first_local_call_attempt_phase_us_.mean()
-                << " receipt_to_first_local_dds_call_attempt_us_max="
-                << low_state_to_first_local_call_attempt_phase_max_us_
-                << " receipt_to_first_local_dds_return_us_mean="
-                << low_state_to_first_local_return_phase_us_.mean()
-                << " receipt_to_first_local_dds_return_us_max="
-                << low_state_to_first_local_return_phase_max_us_
-                << " first_write_budget_us="
-                << std::chrono::duration_cast<std::chrono::microseconds>(
-                       CommandFreshnessFenceT::kMaxFirstWritePhase)
-                       .count()
-                << " hardware_arrival=unavailable"
-                << std::endl;
+      first_write_phase_telemetry_mailbox_.Publish({
+          first_local_dds_phase_sample_count_,
+          writer_telemetry::PackDouble(low_state_to_gate_wake_phase_us_.mean()),
+          writer_telemetry::PackDouble(low_state_to_gate_wake_phase_max_us_),
+          writer_telemetry::PackDouble(gate_wake_to_envelope_phase_us_.mean()),
+          writer_telemetry::PackDouble(gate_wake_to_envelope_phase_max_us_),
+          writer_telemetry::PackDouble(
+              envelope_to_first_local_call_attempt_phase_us_.mean()),
+          writer_telemetry::PackDouble(
+              envelope_to_first_local_call_attempt_phase_max_us_),
+          writer_telemetry::PackDouble(
+              low_state_to_first_local_call_attempt_phase_us_.mean()),
+          writer_telemetry::PackDouble(
+              low_state_to_first_local_call_attempt_phase_max_us_),
+          writer_telemetry::PackDouble(
+              low_state_to_first_local_return_phase_us_.mean()),
+          writer_telemetry::PackDouble(
+              low_state_to_first_local_return_phase_max_us_),
+      });
       first_local_dds_phase_sample_count_ = 0;
       low_state_to_gate_wake_phase_us_.clear();
       gate_wake_to_envelope_phase_us_.clear();
@@ -3005,61 +3159,103 @@ class G1Deploy {
             std::chrono::duration<double, std::micro>(
                 fence_time - envelope.source_low_state_receipt)
                 .count();
-        std::cout << "[WARN] SONIC first local DDS phase deadline missed for LowState generation "
-                  << envelope.source_generation << " receipt_to_fence_us="
-                  << receipt_to_fence_us << "; writing damping ("
-                  << first_local_dds_phase_deadline_miss_count_ << " total; "
-                  << "hardware_arrival=unavailable)" << std::endl;
+        deadline_miss_telemetry_mailbox_.Publish({
+            first_local_dds_phase_deadline_miss_count_,
+            envelope.source_generation,
+            writer_telemetry::PackDouble(receipt_to_fence_us),
+        });
       }
     }
 
     void RecordLocalDdsWriteFailure(
-        const char* command_kind,
+        LowCommandKind command_kind,
         std::optional<std::uint64_t> source_generation,
         CommandFreshnessFenceT::Clock::time_point call_attempt_time,
         CommandFreshnessFenceT::Clock::time_point local_return_time) {
       ++local_dds_write_failure_count_;
-      const auto now = CommandFreshnessFenceT::Clock::now();
-      if (local_dds_write_failure_count_ != 1 &&
-          now - last_local_dds_write_failure_log_time_ < std::chrono::seconds(1)) {
-        return;
-      }
-      last_local_dds_write_failure_log_time_ = now;
       const auto call_duration_us = std::chrono::duration<double, std::micro>(
                                         local_return_time - call_attempt_time)
                                         .count();
-      std::cout << "[WARN] SONIC local DDS Write() failed kind=" << command_kind;
-      if (source_generation.has_value()) {
-        std::cout << " low_state_generation=" << *source_generation;
-      }
-      std::cout << " local_call_duration_us=" << call_duration_us
-                << " failures_total=" << local_dds_write_failure_count_
-                << " hardware_arrival=unavailable" << std::endl;
+      local_dds_failure_telemetry_mailbox_.Publish({
+          local_dds_write_failure_count_,
+          command_kind == LowCommandKind::kDamping ? 1U : 0U,
+          source_generation.has_value() ? 1U : 0U,
+          source_generation.value_or(0),
+          writer_telemetry::PackDouble(call_duration_us),
+      });
     }
 
-    /// Pack and publish one damping or otherwise unphased motor command.
-    /// The result is deliberately observed even though this path has no source
-    /// generation that can be terminally fenced.
-    void WriteMotorCommand(const MotorCommand& motor_command) {
-      SanitizerStateRollback sanitizer_rollback(
-          last_sent_q_target_, has_last_sent_q_target_, sanitize_events_total_,
-          last_sanitize_log_time_);
-
-      LowCmd_ dds_low_command;
-      PopulateLowCommand(motor_command, dds_low_command);
-
-      SanitizeLowCommand(dds_low_command);
-
-      dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-      const auto call_attempt_time = CommandFreshnessFenceT::Clock::now();
-      const bool local_write_succeeded = lowcmd_publisher_->Write(dds_low_command);
-      const auto local_return_time = CommandFreshnessFenceT::Clock::now();
-      if (!local_write_succeeded) {
-        RecordLocalDdsWriteFailure(
-            "damping", std::nullopt, call_attempt_time, local_return_time);
-        return;
+    /// Format writer telemetry from the 100 Hz Input worker. The DDS writer
+    /// only publishes lock-free numeric snapshots so it cannot block a later
+    /// LowState generation on stdout or stream flushing.
+    void EmitWriterTelemetryFromInputThread() {
+      FirstWritePhaseTelemetryMailbox::Payload phase {};
+      if (first_write_phase_telemetry_mailbox_.TryRead(
+              phase, observed_first_write_phase_telemetry_sequence_)) {
+        std::cout << "[SONIC_PHASE] samples=" << phase[kPhaseSamples]
+                  << " receipt_to_gate_wake_us_mean="
+                  << writer_telemetry::UnpackDouble(phase[kReceiptToGateWakeMeanUs])
+                  << " receipt_to_gate_wake_us_max="
+                  << writer_telemetry::UnpackDouble(phase[kReceiptToGateWakeMaxUs])
+                  << " gate_wake_to_envelope_us_mean="
+                  << writer_telemetry::UnpackDouble(phase[kGateWakeToEnvelopeMeanUs])
+                  << " gate_wake_to_envelope_us_max="
+                  << writer_telemetry::UnpackDouble(phase[kGateWakeToEnvelopeMaxUs])
+                  << " envelope_to_first_local_dds_call_attempt_us_mean="
+                  << writer_telemetry::UnpackDouble(phase[kEnvelopeToCallAttemptMeanUs])
+                  << " envelope_to_first_local_dds_call_attempt_us_max="
+                  << writer_telemetry::UnpackDouble(phase[kEnvelopeToCallAttemptMaxUs])
+                  << " receipt_to_first_local_dds_call_attempt_us_mean="
+                  << writer_telemetry::UnpackDouble(phase[kReceiptToCallAttemptMeanUs])
+                  << " receipt_to_first_local_dds_call_attempt_us_max="
+                  << writer_telemetry::UnpackDouble(phase[kReceiptToCallAttemptMaxUs])
+                  << " receipt_to_first_local_dds_return_us_mean="
+                  << writer_telemetry::UnpackDouble(phase[kReceiptToLocalReturnMeanUs])
+                  << " receipt_to_first_local_dds_return_us_max="
+                  << writer_telemetry::UnpackDouble(phase[kReceiptToLocalReturnMaxUs])
+                  << " first_write_budget_us="
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         CommandFreshnessFenceT::kMaxFirstWritePhase)
+                         .count()
+                  << " hardware_arrival=unavailable"
+                  << std::endl;
       }
-      sanitizer_rollback.Commit();
+
+      DeadlineMissTelemetryMailbox::Payload deadline_miss {};
+      if (deadline_miss_telemetry_mailbox_.TryRead(
+              deadline_miss, observed_deadline_miss_telemetry_sequence_)) {
+        std::cout << "[WARN] SONIC first local DDS phase deadline missed for LowState generation "
+                  << deadline_miss[kDeadlineMissGeneration]
+                  << " receipt_to_fence_us="
+                  << writer_telemetry::UnpackDouble(
+                         deadline_miss[kDeadlineMissReceiptToFenceUs])
+                  << "; writing damping (" << deadline_miss[kDeadlineMissCount]
+                  << " total; hardware_arrival=unavailable)" << std::endl;
+      }
+
+      LocalDdsFailureTelemetryMailbox::Payload local_failure {};
+      if (local_dds_failure_telemetry_mailbox_.TryRead(
+              local_failure, observed_local_dds_failure_telemetry_sequence_)) {
+        const auto now = CommandFreshnessFenceT::Clock::now();
+        if (last_local_dds_failure_telemetry_time_ ==
+                std::chrono::steady_clock::time_point{} ||
+            now - last_local_dds_failure_telemetry_time_ >= std::chrono::seconds(1)) {
+          std::cout << "[WARN] SONIC local DDS Write() failed kind="
+                    << (local_failure[kLocalDdsFailureIsDamping] != 0
+                            ? "damping"
+                            : "phased");
+          if (local_failure[kLocalDdsFailureHasGeneration] != 0) {
+            std::cout << " low_state_generation="
+                      << local_failure[kLocalDdsFailureGeneration];
+          }
+          std::cout << " local_call_duration_us="
+                    << writer_telemetry::UnpackDouble(
+                           local_failure[kLocalDdsFailureCallDurationUs])
+                    << " failures_total=" << local_failure[kLocalDdsFailureCount]
+                    << " hardware_arrival=unavailable" << std::endl;
+          last_local_dds_failure_telemetry_time_ = now;
+        }
+      }
     }
 
     /**
@@ -3070,18 +3266,8 @@ class G1Deploy {
      */
     [[nodiscard]] PhasedWriteOutcome WritePhasedMotorCommand(
         const std::shared_ptr<const PhasedMotorCommand>& envelope) {
-      SanitizerStateRollback sanitizer_rollback(
-          last_sent_q_target_, has_last_sent_q_target_, sanitize_events_total_,
-          last_sanitize_log_time_);
-
-      LowCmd_ dds_low_command;
-      PopulateLowCommand(envelope->command, dds_low_command);
-      SanitizeLowCommand(dds_low_command);
-      dds_low_command.crc() =
-          Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-
-      // Reject stale or malformed envelopes before sampling the final SDK-call
-      // boundary below.
+      // Reject stale or malformed envelopes before packing, sanitizing, CRC,
+      // or sampling the final SDK-call boundary below.
       auto fence_time = CommandFreshnessFenceT::Clock::now();
       auto decision = command_freshness_fence_.Evaluate(envelope, fence_time);
       if (!decision.IsAccepted()) {
@@ -3089,6 +3275,29 @@ class G1Deploy {
         // q-target slew reference used by the following damping or fresh write.
         return {decision, fence_time};
       }
+      // Full-gain actuator fields must be finite as produced. In particular,
+      // do not let min/max silently carry a NaN through the sanitizer and into
+      // a CRC-valid DDS packet. This applies to q, dq, tau, kp, and kd; mode
+      // is integral and is packed separately.
+      if (!low_command_safety::HasOnlyFiniteActuatorFields(
+              envelope->command.q_target, envelope->command.dq_target,
+              envelope->command.tau_ff, envelope->command.kp,
+              envelope->command.kd)) {
+        command_freshness_fence_.RejectAcceptedGeneration(
+            envelope->source_generation,
+            CommandFreshnessFenceT::Result::kInvalidCommand);
+        return {{CommandFreshnessFenceT::Result::kInvalidCommand}, fence_time};
+      }
+
+      SanitizerStateRollback sanitizer_rollback(
+          last_sent_q_target_, has_last_sent_q_target_, last_sent_q_target_time_);
+      LowCmd_ dds_low_command;
+      PopulateLowCommand(envelope->command, dds_low_command);
+      const auto sanitize_time = CommandFreshnessFenceT::Clock::now();
+      const SanitizationResult sanitization = SanitizeLowCommand(
+          dds_low_command, sanitize_time, QTargetSlewMode::kFullGainCommand);
+      dds_low_command.crc() =
+          Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
 
       // This exact timestamp is both the first-write fence boundary and the
       // local SDK call-attempt timestamp. A host scheduler can still preempt
@@ -3098,7 +3307,7 @@ class G1Deploy {
       if (decision.IsFirstWrite() &&
           !CommandFreshnessFenceT::IsFirstWritePhaseOnTime(
               *envelope, call_attempt_time)) {
-        command_freshness_fence_.RejectAcceptedFirstWrite(
+        command_freshness_fence_.RejectAcceptedGeneration(
             envelope->source_generation,
             CommandFreshnessFenceT::Result::kFirstWritePhaseDeadlineMissed);
         decision = {CommandFreshnessFenceT::Result::kFirstWritePhaseDeadlineMissed};
@@ -3109,9 +3318,10 @@ class G1Deploy {
       const auto local_return_time = CommandFreshnessFenceT::Clock::now();
       if (!local_write_succeeded) {
         RecordLocalDdsWriteFailure(
-            "phased", envelope->source_generation, call_attempt_time, local_return_time);
+            LowCommandKind::kPhased, envelope->source_generation,
+            call_attempt_time, local_return_time);
         if (decision.IsFirstWrite()) {
-          command_freshness_fence_.RejectAcceptedFirstWrite(
+          command_freshness_fence_.RejectAcceptedGeneration(
               envelope->source_generation,
               CommandFreshnessFenceT::Result::kFirstWriteDispatchFailed);
           decision = {CommandFreshnessFenceT::Result::kFirstWriteDispatchFailed};
@@ -3120,7 +3330,9 @@ class G1Deploy {
         // sanitizer state as it was before packing it.
         return {decision, call_attempt_time, call_attempt_time, local_return_time, false};
       }
+      last_sent_q_target_time_ = local_return_time;
       sanitizer_rollback.Commit();
+      RecordSanitizationAfterSuccessfulWrite(sanitization);
       if (decision.IsFirstWrite()) {
         // Record after the successful publisher return so telemetry/logging
         // cannot delay the bounded call attempt that it is measuring.
@@ -3139,14 +3351,13 @@ class G1Deploy {
     void LowCommandWriter() {
       const std::shared_ptr<const PhasedMotorCommand> envelope =
           motor_command_buffer_.GetDataWithTime().data;
-      const MotorCommand damping_command = MakeDampingCommand();
       if (!envelope) {
-        WriteMotorCommand(damping_command);
+        WriteDampingCommand();
       } else {
         const auto write_outcome = WritePhasedMotorCommand(envelope);
         if (!write_outcome.decision.IsAccepted() ||
             !write_outcome.local_write_succeeded) {
-          WriteMotorCommand(damping_command);
+          WriteDampingCommand();
           if (write_outcome.decision.result ==
               CommandFreshnessFenceT::Result::kFirstWritePhaseDeadlineMissed) {
             RecordPhaseDeadlineMiss(*envelope, write_outcome.fence_time);
@@ -4174,6 +4385,8 @@ class G1Deploy {
         (*record_input_file_) << std::endl;
       }
 
+      EmitWriterTelemetryFromInputThread();
+      EmitSanitizerTelemetryFromInputThread();
     }
 
     /**

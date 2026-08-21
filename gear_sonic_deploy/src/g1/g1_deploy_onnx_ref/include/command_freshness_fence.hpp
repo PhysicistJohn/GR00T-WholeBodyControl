@@ -60,6 +60,9 @@ class CommandFreshnessFence {
     // The SDK rejected the first local DDS dispatch. This generation is
     // terminally fenced so a later 500 Hz retransmission cannot revive it.
     kFirstWriteDispatchFailed,
+    // The writer found a non-finite actuator field before CRC/DDS dispatch.
+    // This generation is terminally fenced and must fall back to damping.
+    kInvalidCommand,
     kGenerationRegressed,
   };
 
@@ -79,14 +82,20 @@ class CommandFreshnessFence {
            now - envelope.source_low_state_receipt <= kMaxFirstWritePhase;
   }
 
-  /// Convert an accepted-but-not-yet-dispatched first write into a terminal
-  /// result. The caller uses this for a final deadline recheck or an SDK-local
-  /// dispatch failure; the same generation can never be accepted again.
-  void RejectAcceptedFirstWrite(std::uint64_t generation, Result terminal_result) {
+  /// Convert the current accepted generation into a terminal result. The
+  /// caller uses this for a final deadline recheck, an SDK-local dispatch
+  /// failure, or malformed actuator fields; that generation can never be
+  /// accepted again.
+  void RejectAcceptedGeneration(std::uint64_t generation, Result terminal_result) {
     if (has_processed_generation_ && generation == last_processed_generation_ &&
         last_generation_result_ == Result::kAccepted) {
       last_generation_result_ = terminal_result;
     }
+  }
+
+  /// Compatibility spelling for first-write-only callers.
+  void RejectAcceptedFirstWrite(std::uint64_t generation, Result terminal_result) {
+    RejectAcceptedGeneration(generation, terminal_result);
   }
 
   /**

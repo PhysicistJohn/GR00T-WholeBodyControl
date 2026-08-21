@@ -224,6 +224,24 @@ set_target_properties(sanitizer_state_rollback_test PROPERTIES
   CXX_STANDARD_REQUIRED ON
   CXX_EXTENSIONS OFF)
 
+add_executable(low_command_safety_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/low_command_safety_test.cpp)
+target_include_directories(low_command_safety_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/)
+set_target_properties(low_command_safety_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+
+add_executable(writer_telemetry_mailbox_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/writer_telemetry_mailbox_test.cpp)
+target_include_directories(writer_telemetry_mailbox_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/)
+set_target_properties(writer_telemetry_mailbox_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+
 add_executable(streamed_motion_merger_test
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/streamed_motion_merger_test.cpp)
 target_include_directories(streamed_motion_merger_test PRIVATE ${EXE_INCLUDES})

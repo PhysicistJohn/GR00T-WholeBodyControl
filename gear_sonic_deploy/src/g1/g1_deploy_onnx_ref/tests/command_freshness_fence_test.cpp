@@ -207,6 +207,28 @@ void TestFailedFirstLocalDispatchIsTerminal() {
          "only a fresh newer generation may recover after a failed first dispatch");
 }
 
+void TestInvalidActuatorCommandIsTerminal() {
+  const auto receipt = Fence::Clock::time_point{565s};
+  Fence fence;
+  const auto candidate = fence.Evaluate(CommandAt(56, receipt), receipt + 1ms);
+  Expect(candidate.IsAccepted() && candidate.IsFirstWrite(),
+         "a fresh generation must be evaluated before invalid-command fencing");
+
+  // Model the writer rejecting a non-finite q/dq/tau/kp/kd field before it
+  // computes CRC or calls DDS. The same source generation must stay fenced.
+  fence.RejectAcceptedGeneration(56, Fence::Result::kInvalidCommand);
+  Expect(fence.Evaluate(CommandAt(56, receipt), receipt + 2ms).result ==
+             Fence::Result::kInvalidCommand,
+         "an invalid actuator command must remain terminal for its generation");
+  Expect(fence.Evaluate(CommandAt(56, receipt), receipt + 3ms).result ==
+             Fence::Result::kInvalidCommand,
+         "a later writer retransmit must not revive an invalid command");
+
+  const auto recovered = fence.Evaluate(CommandAt(57, receipt + 3ms), receipt + 4ms);
+  Expect(recovered.IsAccepted() && recovered.IsFirstWrite(),
+         "only a fresh newer generation may recover after invalid-command damping");
+}
+
 void TestPhaseProvenanceMustBeCompleteAndOrdered() {
   Fence fence;
   const auto receipt = Fence::Clock::time_point{575s};
@@ -272,6 +294,7 @@ int main() {
   TestFreshNewGenerationRecoversFromDamping();
   TestFirstWritePhaseDeadlineIsInclusiveAndFencesLateGenerations();
   TestFailedFirstLocalDispatchIsTerminal();
+  TestInvalidActuatorCommandIsTerminal();
   TestPhaseProvenanceMustBeCompleteAndOrdered();
   TestRejectedCommandsSelectKnownDampingShape();
   TestInitAndWaitLeasesRenewThenExpire();
