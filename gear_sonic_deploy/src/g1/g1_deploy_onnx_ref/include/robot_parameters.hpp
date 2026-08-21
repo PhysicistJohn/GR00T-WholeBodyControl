@@ -20,6 +20,7 @@
 #define ROBOT_PARAMETERS_HPP
 
 #include <array>
+#include <string>
 
 // ---------------------------------------------------------------------------
 // Unitree SDK DDS topic names

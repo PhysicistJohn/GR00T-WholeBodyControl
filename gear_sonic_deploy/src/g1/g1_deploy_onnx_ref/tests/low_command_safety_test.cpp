@@ -83,10 +83,14 @@ void TestCanonicalDampingRetainsEveryLastSafeReferenceWhenUnavailable() {
   }
 
   const auto now = Clock::time_point {100ms};
+  int unavailable_reader_calls = 0;
   const auto unavailable =
       low_command_safety::BuildCanonicalDampingFields<G1_NUM_MOTOR>(
           /*has_measured_state=*/false,
-          [](std::size_t) { return std::numeric_limits<float>::quiet_NaN(); },
+          [&unavailable_reader_calls](std::size_t) {
+            ++unavailable_reader_calls;
+            return std::numeric_limits<float>::quiet_NaN();
+          },
           now, now, 10ms, previously_published,
           /*has_previously_published=*/true);
   const auto stale = low_command_safety::BuildCanonicalDampingFields<G1_NUM_MOTOR>(
@@ -98,7 +102,9 @@ void TestCanonicalDampingRetainsEveryLastSafeReferenceWhenUnavailable() {
           /*has_measured_state=*/true,
           [](std::size_t) { return std::numeric_limits<float>::quiet_NaN(); },
           now - 1ms, now, 10ms, previously_published,
-          /*has_previously_published=*/true);
+      /*has_previously_published=*/true);
+  Expect(unavailable_reader_calls == 0,
+         "a missing LowState must not dereference a measurement reader");
   for (std::size_t i = 0; i < previously_published.size(); ++i) {
     Expect(NearlyEqual(unavailable.q_target[i], previously_published[i]),
            "a missing LowState must retain every last safe q target");
